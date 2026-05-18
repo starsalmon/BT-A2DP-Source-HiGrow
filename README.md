@@ -17,7 +17,7 @@ Standalone **Bluetooth A2DP Source (transmitter)** test for an **ESP32 (Classic 
 
 ### Setup
 1. Open this folder in PlatformIO.
-2. Edit `src/main.cpp` and set:
+2. Edit `include/options.h` and set:
    - `#define A2DP_SINK_NAME "Your Speaker Name"`
    - (Bridge mode) set I2S pins:
      - `I2S_BCK_PIN`, `I2S_WS_PIN`, `I2S_DATA_IN_PIN`
@@ -38,7 +38,7 @@ The ESP32 is configured as **I2S SLAVE RX** (upstream device provides the clocks
 ### UART control (recommended)
 This firmware can be controlled by another MCU via UART (line-based, `\n` terminated).
 
-Defaults (override with `#define`s in `src/main.cpp`):
+Defaults (override with `#define`s in `include/options.h`):
 - **CTRL UART**: `RX=GPIO39` (input-only), `TX=GPIO13`, `115200 baud`
 - **Wake pin**: `GPIO38` (EXT0 wake, level high)
 

@@ -7,89 +7,16 @@
 #include "driver/rtc_io.h"
 
 #include "BluetoothA2DPSource.h"
+#include "options.h"
 
-// Set this to the *Bluetooth name of your speaker/headphones*.
-// Example: "JBL Flip 5", "UE BOOM 3", etc.
-#ifndef A2DP_SINK_NAME
-#define A2DP_SINK_NAME "HiFi-IIS"
-#endif
-
-// -------- Logging controls (defaults: quiet) --------
-// Set these to 1 (e.g. via PlatformIO build_flags) when debugging.
-#ifndef HIGROW_LOG_TELEMETRY
-#define HIGROW_LOG_TELEMETRY 0
-#endif
-#ifndef HIGROW_LOG_DISCOVERY
-#define HIGROW_LOG_DISCOVERY 0
-#endif
-#ifndef HIGROW_LOG_CTRL
-#define HIGROW_LOG_CTRL 1
-#endif
-
-// Enable I2S -> A2DP bridge. If disabled, we fall back to a generated test tone.
-#ifndef USE_I2S_INPUT
-#define USE_I2S_INPUT 1
-#endif
-
-// A2DP (SBC) expects PCM typically as 44.1kHz, 16-bit, stereo.
-// For the bridge, your upstream I2S source should match this (or accept pitch/tempo shift).
-static constexpr int kSampleRateHz = 44100;
+static constexpr int kSampleRateHz = A2DP_SAMPLE_RATE_HZ;
 
 // -------- Control UART (ProS3 <-> HiGrow) --------
 // A simple line-based command protocol so the ProS3 can control BT connect/sleep.
 // Default pins are chosen to work with your stated availability:
 // - TX can be any output-capable pin (default 13)
 // - RX can be an input-only pin (default 39)
-#ifndef CTRL_UART_ENABLE
-#define CTRL_UART_ENABLE 1
-#endif
-#ifndef CTRL_UART_BAUD
-#define CTRL_UART_BAUD 115200
-#endif
-#ifndef CTRL_UART_TX_PIN
-#define CTRL_UART_TX_PIN 13
-#endif
-#ifndef CTRL_UART_RX_PIN
-#define CTRL_UART_RX_PIN 39
-#endif
-
-// Wake pin (HiGrow deep sleep wakeup). Must be RTC-capable GPIO.
-// Using an input-only RTC pin is fine. Default 38 (you said 38 is available, input-only).
-// ProS3 should drive this pin HIGH for wake (pulse or level).
-#ifndef WAKE_PIN
-#define WAKE_PIN 38
-#endif
-#ifndef WAKE_LEVEL
-#define WAKE_LEVEL 1
-#endif
-
-// I2S input pins (ESP32 receives PCM from another device, e.g. your ESP32-S3).
-// Wiring: S3_BCLK -> I2S_BCK_PIN, S3_LRCLK -> I2S_WS_PIN, S3_DOUT -> I2S_DATA_IN_PIN, GND -> GND
-#ifndef I2S_BCK_PIN
-#define I2S_BCK_PIN 17
-#endif
-#ifndef I2S_WS_PIN
-#define I2S_WS_PIN 23
-#endif
-#ifndef I2S_DATA_IN_PIN
-#define I2S_DATA_IN_PIN 19
-#endif
-
-// I2S input slot width.
-// Many ESP32 I2S setups output 32-bit slots even when the “audio” is 16-bit.
-// If you hear mostly clicking/static, try setting this to 32.
-#ifndef I2S_IN_BITS
-#define I2S_IN_BITS 32
-#endif
-
-// When I2S_IN_BITS=32, choose where the 16-bit audio lives inside the 32-bit slot.
-// Most common is left-justified (MSB 16 bits). If audio is still wrong, try 0.
-#ifndef I2S_32BIT_USE_MSB16
-#define I2S_32BIT_USE_MSB16 1
-#endif
-
-// Ring buffer (bytes). Needs to cover BT scheduling jitter.
-static constexpr size_t kPcmRingBytes = 64 * 1024;
+static constexpr size_t kPcmRingBytes = (size_t)PCM_RING_BYTES;
 
 BluetoothA2DPSource a2dp_source;
 
