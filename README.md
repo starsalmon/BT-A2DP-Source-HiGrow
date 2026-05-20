@@ -44,11 +44,13 @@ Defaults (override with `#define`s in `include/options.h`):
 
 Commands:
 - `PING` → `PONG`
-- `STATUS` → prints connection/audio state + buffer stats
+- `STATUS` → prints connection/audio state + buffer stats (includes current upstream PCM `sr=...`)
 - `CONNECT <name>` → scan + connect to the first matching sink name
 - `DISCONNECT` → best-effort disconnect (keeps stack ready)
 - `BT_OFF` → disconnect + `end(true)` (release memory)
 - `BT_ON` → start again with last name
+- `SR <hz>` → set the **upstream PCM sample rate** on the I2S lines (`44100` or `48000`)
+  - A2DP output is fixed to **44.1kHz**; when `SR 48000` is set, the bridge resamples **48k → 44.1k** before encoding
 - `SLEEP` → disconnect + deep sleep (wake on `WAKE_PIN`)
 
 ### Notes (upload/reset)
