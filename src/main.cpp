@@ -34,6 +34,101 @@ static volatile bool s_shuttingDown = false;
 static TaskHandle_t s_i2sTask = nullptr;
 static volatile bool s_i2sTaskStopped = true;
 
+// The ProS3 can switch stream sample rates (podcasts are often 48kHz).
+// A2DP (SBC) output in this project is fixed to kSampleRateHz, so when the input
+// rate differs we resample into the PCM ring buffer to avoid pitch shift/clicks.
+static volatile uint32_t s_inPcmHz = (uint32_t)kSampleRateHz;
+
+#if USE_I2S_INPUT
+// Forward declaration: ring_write is defined below, but used by the resampler helper.
+static void ring_write(const uint8_t *data, size_t len);
+
+static uint32_t s_rs_inHz = 0;
+static uint32_t s_rs_phase_q16 = 0;  // Q16.16 position in input frames (index 0 is prev sample)
+static uint32_t s_rs_step_q16 = 0;   // Q16.16 input-frames per output-frame
+static int16_t s_rs_prevL = 0;
+static int16_t s_rs_prevR = 0;
+static bool s_rs_hasPrev = false;
+
+static inline void resamplerReset(uint32_t inHz) {
+  s_rs_inHz = inHz;
+  s_rs_phase_q16 = 0;
+  s_rs_step_q16 = (uint32_t)(((uint64_t)inHz << 16) / (uint64_t)kSampleRateHz);
+  s_rs_prevL = 0;
+  s_rs_prevR = 0;
+  s_rs_hasPrev = false;
+}
+
+static inline void ring_write_pcm_44k1(int16_t* interleavedLR, size_t frames, uint32_t inHz) {
+  if (!interleavedLR || frames == 0) return;
+  // Only handle the two rates we care about today.
+  if (inHz != 44100u && inHz != 48000u) inHz = 44100u;
+
+  // Fast path: already at the encoder rate.
+  if (inHz == (uint32_t)kSampleRateHz) {
+    ring_write(reinterpret_cast<const uint8_t*>(interleavedLR), frames * 4);
+    return;
+  }
+
+  // Downsample 48k -> 44.1k with simple linear interpolation.
+  if (s_rs_inHz != inHz || s_rs_step_q16 == 0) {
+    resamplerReset(inHz);
+  }
+
+  // Initialize prev sample on first block so interpolation has a stable starting point.
+  if (!s_rs_hasPrev) {
+    s_rs_prevL = interleavedLR[0];
+    s_rs_prevR = interleavedLR[1];
+    s_rs_hasPrev = true;
+  }
+
+  const uint32_t maxPhase = (uint32_t)frames << 16; // idx in [0..frames-1] valid, idx+1 in [1..frames]
+  size_t outFrames = 0;
+
+  // Output buffer (int16 interleaved L/R). Sized for the largest chunk we read (4096 bytes => 1024 frames).
+  static int16_t s_out[2048];
+
+  while (s_rs_phase_q16 < maxPhase && (outFrames + 1) < frames && (outFrames * 2 + 1) < (sizeof(s_out) / sizeof(s_out[0]))) {
+    const uint32_t idx = (s_rs_phase_q16 >> 16);
+    const uint32_t frac = (s_rs_phase_q16 & 0xFFFFu);
+
+    int16_t l0 = 0, r0 = 0, l1 = 0, r1 = 0;
+    if (idx == 0) {
+      l0 = s_rs_prevL;
+      r0 = s_rs_prevR;
+      l1 = interleavedLR[0];
+      r1 = interleavedLR[1];
+    } else {
+      const size_t i0 = (size_t)(idx - 1) * 2;
+      const size_t i1 = (size_t)(idx) * 2;
+      l0 = interleavedLR[i0 + 0];
+      r0 = interleavedLR[i0 + 1];
+      l1 = interleavedLR[i1 + 0];
+      r1 = interleavedLR[i1 + 1];
+    }
+
+    const int32_t dl = (int32_t)l1 - (int32_t)l0;
+    const int32_t dr = (int32_t)r1 - (int32_t)r0;
+    const int32_t lo = (int32_t)l0 + (int32_t)((dl * (int32_t)frac) >> 16);
+    const int32_t ro = (int32_t)r0 + (int32_t)((dr * (int32_t)frac) >> 16);
+
+    s_out[outFrames * 2 + 0] = (int16_t)lo;
+    s_out[outFrames * 2 + 1] = (int16_t)ro;
+    outFrames++;
+
+    s_rs_phase_q16 += s_rs_step_q16;
+  }
+
+  // Carry phase forward to the next block and keep the last input frame as "prev".
+  s_rs_phase_q16 = (s_rs_phase_q16 >= maxPhase) ? (s_rs_phase_q16 - maxPhase) : 0u;
+  s_rs_prevL = interleavedLR[(frames - 1) * 2 + 0];
+  s_rs_prevR = interleavedLR[(frames - 1) * 2 + 1];
+  s_rs_hasPrev = true;
+
+  ring_write(reinterpret_cast<const uint8_t*>(s_out), outFrames * 4);
+}
+#endif
+
 static bool namePrefixMatchI(const char *ssid, const char *want) {
   if (!ssid || !ssid[0] || !want || !want[0]) return false;
   for (size_t i = 0; want[i]; i++) {
@@ -239,7 +334,7 @@ static void i2s_reader_task(void *) {
           s_pcm_peak = (uint32_t)peak;
           s_pcm_dc_abs = (uint32_t)((mean < 0) ? -mean : mean);
 
-          ring_write(tmp, bytes_read);
+          ring_write_pcm_44k1(reinterpret_cast<int16_t*>(tmp), bytes_read / 4, s_inPcmHz);
         }
       } else {
         bytes_read &= ~((size_t)7); // 8 bytes per stereo 32-bit frame
@@ -267,7 +362,7 @@ static void i2s_reader_task(void *) {
           s_pcm_dc_abs = (uint32_t)((mean < 0) ? -mean : mean);
 
           s_i2s_read_bytes += out_bytes;
-          ring_write(reinterpret_cast<const uint8_t *>(out), out_bytes);
+          ring_write_pcm_44k1(out, out_bytes / 4, s_inPcmHz);
         }
       }
     }
@@ -454,15 +549,16 @@ static void handleCtrlLine(const String &line) {
   }
 
   if (cmd == "HELP") {
-    s_ctrlSerial.println("OK cmds: PING, STATUS, CONNECT <name>, DISCONNECT, BT_ON, BT_OFF, SLEEP");
+    s_ctrlSerial.println("OK cmds: PING, STATUS, CONNECT <name>, DISCONNECT, BT_ON, BT_OFF, SR <hz>, SLEEP");
     return;
   }
 
   if (cmd == "STATUS") {
-    s_ctrlSerial.printf("STATUS conn=%d audio=%d bt=%d ring=%u i2sB=%u underrunB=%u overrunB=%u peak=%u dc=%u\n",
+    s_ctrlSerial.printf("STATUS conn=%d audio=%d bt=%d sr=%u ring=%u i2sB=%u underrunB=%u overrunB=%u peak=%u dc=%u\n",
                         (int)a2dp_source.get_connection_state(),
                         (int)a2dp_source.get_audio_state(),
                         (int)(s_btStarted ? 1 : 0),
+                        (unsigned)s_inPcmHz,
 #if USE_I2S_INPUT
                         (unsigned)s_ring_fill,
                         (unsigned)s_i2s_read_bytes,
@@ -474,6 +570,24 @@ static void handleCtrlLine(const String &line) {
                         0u, 0u, 0u, 0u, 0u, 0u
 #endif
     );
+    return;
+  }
+
+  if (cmd == "SR") {
+    if (arg.isEmpty()) {
+      s_ctrlSerial.println("ERR missing hz");
+      return;
+    }
+    const uint32_t hz = (uint32_t)arg.toInt();
+    if (hz != 44100u && hz != 48000u) {
+      s_ctrlSerial.println("ERR hz must be 44100 or 48000");
+      return;
+    }
+    s_inPcmHz = hz;
+#if USE_I2S_INPUT
+    resamplerReset(hz);
+#endif
+    s_ctrlSerial.printf("OK sr=%u\n", (unsigned)hz);
     return;
   }
 
