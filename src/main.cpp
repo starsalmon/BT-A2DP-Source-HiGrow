@@ -53,6 +53,9 @@ static String s_ctrlLine;
 
 static TaskHandle_t s_i2sTask = nullptr;
 static volatile bool s_i2sTaskStopped = true;
+#if USE_I2S_INPUT
+static volatile bool s_i2sReaderStopRequested = false;
+#endif
 
 static void ctrlPrintln(const char *line) {
 #if CTRL_UART_ENABLE
@@ -95,10 +98,22 @@ static void setMetaArtist(const char *a) {
 
 static void i2sSlaveRxStop() {
 #if USE_I2S_INPUT
-  if (s_i2sTask) {
-    i2s_stop(I2S_NUM_0);
+  if (s_i2sTask != nullptr || s_i2sSlaveRxInstalled) {
+    s_i2sReaderStopRequested = true;
+    if (s_i2sSlaveRxInstalled) {
+      i2s_stop(I2S_NUM_0);
+    }
     const uint32_t t0 = millis();
-    while (!s_i2sTaskStopped && (millis() - t0) < 800) delay(10);
+    while (s_i2sTask != nullptr && (millis() - t0) < 2000) {
+      delay(10);
+    }
+    s_i2sReaderStopRequested = false;
+    if (s_i2sTask != nullptr) {
+      Serial.println("[I2S] reader task stop timeout; forcing delete");
+      vTaskDelete(s_i2sTask);
+      s_i2sTask = nullptr;
+      s_i2sTaskStopped = true;
+    }
   }
   if (s_i2sSlaveRxInstalled) {
     i2s_driver_uninstall(I2S_NUM_0);
@@ -112,7 +127,11 @@ static bool i2sSlaveRxStart() {
 #if !USE_I2S_INPUT
   return false;
 #else
-  if (s_i2sSlaveRxInstalled) return true;
+  if (s_i2sSlaveRxInstalled && s_i2sTask != nullptr) return true;
+  if (s_i2sSlaveRxInstalled) {
+    i2s_driver_uninstall(I2S_NUM_0);
+    s_i2sSlaveRxInstalled = false;
+  }
 
   i2s_config_t cfg = {};
   cfg.mode = (i2s_mode_t)(I2S_MODE_SLAVE | I2S_MODE_RX);
@@ -184,6 +203,7 @@ static bool i2sMasterTxStart(uint32_t sampleRateHz) {
 static void i2sMasterTxStop() {
   if (!s_i2sMasterTxInstalled) return;
   i2s_stop(I2S_NUM_0);
+  delay(20);
   i2s_driver_uninstall(I2S_NUM_0);
   s_i2sMasterTxInstalled = false;
   i2sSharedPinsSafeInput();
@@ -204,7 +224,7 @@ static void applySwVolume(int16_t *lr, size_t nSamples) {
 }
 
 static void rxStreamToI2s(const uint8_t *data, uint32_t len) {
-  if (!data || len < 4 || !s_i2sMasterTxInstalled) return;
+  if (!data || len < 4 || !s_rxSinkStarted || !s_i2sMasterTxInstalled) return;
   const size_t frames = len / 4;
   static int32_t slotBuf[512 * 2];
   const size_t maxFrames = sizeof(slotBuf) / (2 * sizeof(int32_t));
@@ -229,8 +249,9 @@ static void rxStreamToI2s(const uint8_t *data, uint32_t len) {
 
 static void rxSinkStop() {
   if (!s_rxSinkStarted) return;
-  a2dp_sink.end(true);
   s_rxSinkStarted = false;
+  a2dp_sink.end(true);
+  delay(50);
   i2sMasterTxStop();
 }
 
@@ -528,7 +549,12 @@ static void i2s_reader_task(void *) {
   uint32_t last_nonzero_ms = millis();
   bool warned_no_i2s = false;
   while (true) {
-    if (s_shuttingDown) {
+    if (s_shuttingDown || s_i2sReaderStopRequested) {
+      s_i2sTaskStopped = true;
+      s_i2sTask = nullptr;
+      vTaskDelete(nullptr);
+    }
+    if (!s_i2sSlaveRxInstalled) {
       s_i2sTaskStopped = true;
       s_i2sTask = nullptr;
       vTaskDelete(nullptr);
