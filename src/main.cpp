@@ -340,6 +340,7 @@ static bool rxSinkStart(const char *name) {
 #endif
   });
   a2dp_sink.set_volume(s_swVol);
+  a2dp_sink.set_auto_reconnect(true, 30);
   a2dp_sink.start(s_rxLocalName);
   s_rxSinkStarted = true;
   s_opMode = BridgeOpMode::RX;
@@ -932,6 +933,11 @@ static void handleCtrlLine(const String &line) {
                           (int)a2dp_sink.get_audio_state(),
                           (int)(s_rxSinkStarted ? 1 : 0),
                           (unsigned)s_swVol);
+      // ProS3 polls STATUS often; re-send cached metadata so the UI catches up after handover.
+      publishMetaUart();
+      if (a2dp_sink.get_connection_state() == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+        requestAvrcMetadata();
+      }
       return;
     }
     s_ctrlSerial.printf("STATUS mode=tx conn=%d audio=%d bt=%d sr=%u ring=%u i2sB=%u underrunB=%u overrunB=%u peak=%u dc=%u\n",
@@ -1061,6 +1067,12 @@ void loop() {
                     (unsigned)total,
                     (unsigned)s_rxI2sSampleRateHz,
                     (unsigned)s_swVol);
+    }
+    static uint32_t last_meta_poll_ms = 0;
+    if (a2dp_sink.get_connection_state() == ESP_A2D_CONNECTION_STATE_CONNECTED &&
+        (uint32_t)(now - last_meta_poll_ms) >= 15000UL) {
+      last_meta_poll_ms = now;
+      requestAvrcMetadata();
     }
   }
 
