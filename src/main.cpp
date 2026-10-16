@@ -7,9 +7,11 @@
 #include "driver/rtc_io.h"
 
 #include "BluetoothA2DPSource.h"
+#include "BluetoothA2DPCommon.h"
 #include "BluetoothA2DPSink.h"
 #include "options.h"
 #include "driver/gpio.h"
+#include "esp_avrc_api.h"
 
 static constexpr int kSampleRateHz = A2DP_SAMPLE_RATE_HZ;
 
@@ -75,12 +77,21 @@ static void i2sSharedPinsSafeInput() {
   }
 }
 
+static void sanitizeMetaField(char *dst, size_t dstLen) {
+  if (!dst || dstLen == 0) return;
+  for (size_t i = 0; dst[i] && i < dstLen; i++) {
+    if (dst[i] == '\r' || dst[i] == '\n') dst[i] = ' ';
+  }
+}
+
 static void publishMetaUart() {
 #if CTRL_UART_ENABLE
   if (s_metaTitle[0]) {
+    Serial.printf("[RX] META title=%s\n", s_metaTitle);
     s_ctrlSerial.printf("META title=%s\n", s_metaTitle);
   }
   if (s_metaArtist[0]) {
+    Serial.printf("[RX] META artist=%s\n", s_metaArtist);
     s_ctrlSerial.printf("META artist=%s\n", s_metaArtist);
   }
 #endif
@@ -89,13 +100,23 @@ static void publishMetaUart() {
 static void setMetaTitle(const char *t) {
   if (!t) return;
   strlcpy(s_metaTitle, t, sizeof(s_metaTitle));
+  sanitizeMetaField(s_metaTitle, sizeof(s_metaTitle));
   publishMetaUart();
 }
 
 static void setMetaArtist(const char *a) {
   if (!a) return;
   strlcpy(s_metaArtist, a, sizeof(s_metaArtist));
+  sanitizeMetaField(s_metaArtist, sizeof(s_metaArtist));
   publishMetaUart();
+}
+
+static void requestAvrcMetadata() {
+  if (!s_rxSinkStarted) return;
+  const uint8_t mask = ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST;
+  const esp_err_t err =
+      esp_avrc_ct_send_metadata_cmd(APP_RC_CT_TL_GET_META_DATA, mask);
+  Serial.printf("[RX] META request mask=0x%02x err=%d\n", (unsigned)mask, (int)err);
 }
 
 static void i2sSlaveRxStop() {
@@ -268,6 +289,7 @@ static bool rxSinkStart(const char *name) {
   i2sSlaveRxStop();
 
   s_rxI2sWriteBytes = 0;
+  s_metaTitle[0] = s_metaArtist[0] = '\0';
   if (!i2sMasterTxStart(44100)) {
     Serial.println("[RX] I2S master TX install failed");
     return false;
@@ -275,6 +297,7 @@ static bool rxSinkStart(const char *name) {
   Serial.printf("[RX] I2S master TX bck=%d ws=%d dout=%d sr=%u 32bit_slots\n",
                 I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_OUT_PIN, (unsigned)s_rxI2sSampleRateHz);
 
+  a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST);
   a2dp_sink.set_stream_reader(rxStreamToI2s, false);
   a2dp_sink.set_on_connection_state_changed(
       [](esp_a2d_connection_state_t state, void *) {
@@ -288,18 +311,26 @@ static bool rxSinkStart(const char *name) {
       [](esp_a2d_audio_state_t state, void *) {
         Serial.printf("[RX] A2DP audio %s\n",
                       (state == ESP_A2D_AUDIO_STATE_STARTED) ? "STARTED" : "STOPPED");
+        if (state == ESP_A2D_AUDIO_STATE_STARTED) {
+          requestAvrcMetadata();
+        }
       },
       nullptr);
+  a2dp_sink.set_avrc_connection_state_callback([](bool connected) {
+    Serial.printf("[RX] AVRC %s\n", connected ? "CONNECTED" : "DISCONNECTED");
+    if (connected) requestAvrcMetadata();
+  });
+  a2dp_sink.set_avrc_rn_track_change_callback([](uint8_t *) { requestAvrcMetadata(); });
   a2dp_sink.set_sample_rate_callback([](uint16_t rate) {
     s_rxI2sSampleRateHz = rate;
     Serial.printf("[RX] sample_rate=%u Hz\n", (unsigned)rate);
   });
   a2dp_sink.set_avrc_metadata_callback([](uint8_t id, const uint8_t *text) {
-    if (!text) return;
-    if (id == ESP_AVRC_MD_ATTR_TITLE) setMetaTitle((const char *)text);
-    else if (id == ESP_AVRC_MD_ATTR_ARTIST) setMetaArtist((const char *)text);
+    if (!text || !text[0]) return;
+    Serial.printf("[RX] AVRC metadata attr=0x%02x text='%s'\n", (unsigned)id, (const char *)text);
+    if (id == ESP_AVRC_MD_ATTR_TITLE || id == 0x01) setMetaTitle((const char *)text);
+    else if (id == ESP_AVRC_MD_ATTR_ARTIST || id == 0x02) setMetaArtist((const char *)text);
   });
-  a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST);
   a2dp_sink.set_on_volumechange([](int v) {
     if (v < 0) v = 0;
     if (v > 127) v = 127;
