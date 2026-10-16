@@ -28,6 +28,8 @@ static const char *kTag = "BT_TX";
 enum class BridgeOpMode : uint8_t { TX = 0, RX = 1 };
 static BridgeOpMode s_opMode = BridgeOpMode::TX;
 static bool s_rxSinkStarted = false;
+static volatile uint32_t s_rxI2sWriteBytes = 0;
+static uint32_t s_rxI2sSampleRateHz = 44100;
 static bool s_i2sSlaveRxInstalled = false;
 static char s_rxLocalName[64] = A2DP_RX_LOCAL_NAME;
 static volatile uint8_t s_swVol = 127;  // 0..127 (AVRCP / UART VOL)
@@ -243,6 +245,7 @@ static void rxStreamToI2s(const uint8_t *data, uint32_t len) {
     }
     size_t written = 0;
     i2s_write(I2S_NUM_0, slotBuf, chunk * 8, &written, portMAX_DELAY);
+    s_rxI2sWriteBytes += written;
     off += chunk;
   }
 }
@@ -250,6 +253,7 @@ static void rxStreamToI2s(const uint8_t *data, uint32_t len) {
 static void rxSinkStop() {
   if (!s_rxSinkStarted) return;
   s_rxSinkStarted = false;
+  Serial.println("[RX] sink stop");
   a2dp_sink.end(true);
   delay(50);
   i2sMasterTxStop();
@@ -263,12 +267,33 @@ static bool rxSinkStart(const char *name) {
   btStopGraceful(true);
   i2sSlaveRxStop();
 
+  s_rxI2sWriteBytes = 0;
   if (!i2sMasterTxStart(44100)) {
     Serial.println("[RX] I2S master TX install failed");
     return false;
   }
+  Serial.printf("[RX] I2S master TX bck=%d ws=%d dout=%d sr=%u 32bit_slots\n",
+                I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_OUT_PIN, (unsigned)s_rxI2sSampleRateHz);
 
   a2dp_sink.set_stream_reader(rxStreamToI2s, false);
+  a2dp_sink.set_on_connection_state_changed(
+      [](esp_a2d_connection_state_t state, void *) {
+        Serial.printf("[RX] A2DP conn %s\n", (state == ESP_A2D_CONNECTION_STATE_CONNECTED) ? "CONNECTED"
+                          : (state == ESP_A2D_CONNECTION_STATE_CONNECTING) ? "CONNECTING"
+                          : (state == ESP_A2D_CONNECTION_STATE_DISCONNECTING) ? "DISCONNECTING"
+                          : "DISCONNECTED");
+      },
+      nullptr);
+  a2dp_sink.set_on_audio_state_changed(
+      [](esp_a2d_audio_state_t state, void *) {
+        Serial.printf("[RX] A2DP audio %s\n",
+                      (state == ESP_A2D_AUDIO_STATE_STARTED) ? "STARTED" : "STOPPED");
+      },
+      nullptr);
+  a2dp_sink.set_sample_rate_callback([](uint16_t rate) {
+    s_rxI2sSampleRateHz = rate;
+    Serial.printf("[RX] sample_rate=%u Hz\n", (unsigned)rate);
+  });
   a2dp_sink.set_avrc_metadata_callback([](uint8_t id, const uint8_t *text) {
     if (!text) return;
     if (id == ESP_AVRC_MD_ATTR_TITLE) setMetaTitle((const char *)text);
@@ -288,6 +313,7 @@ static bool rxSinkStart(const char *name) {
   s_rxSinkStarted = true;
   s_opMode = BridgeOpMode::RX;
   s_lastUseMs = millis();
+  Serial.printf("[RX] sink started name='%s' vol=%u\n", s_rxLocalName, (unsigned)s_swVol);
   return true;
 }
 
@@ -958,7 +984,25 @@ void loop() {
   static uint32_t last_a2dp_cb_calls = 0;
   static uint32_t last_ring_underrun_bytes = 0;
   static uint32_t last_ring_overrun_bytes = 0;
+  static uint32_t last_rx_i2s_bytes = 0;
+  static uint32_t last_rx_stats_ms = 0;
   const uint32_t now = millis();
+
+  if (s_opMode == BridgeOpMode::RX && s_rxSinkStarted) {
+    if ((uint32_t)(now - last_rx_stats_ms) >= 1000UL) {
+      last_rx_stats_ms = now;
+      const uint32_t total = s_rxI2sWriteBytes;
+      const uint32_t delta = total - last_rx_i2s_bytes;
+      last_rx_i2s_bytes = total;
+      Serial.printf("[RX] conn=%d audio=%d i2s_tx=+%uB (total %u) sr=%u vol=%u\n",
+                    (int)a2dp_sink.get_connection_state(),
+                    (int)a2dp_sink.get_audio_state(),
+                    (unsigned)delta,
+                    (unsigned)total,
+                    (unsigned)s_rxI2sSampleRateHz,
+                    (unsigned)s_swVol);
+    }
+  }
 
   const uint32_t stats_period_ms = s_btStarted ? 1000UL : 10000UL;
   const uint32_t pcm_period_ms = s_btStarted ? 1000UL : 30000UL;
