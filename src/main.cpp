@@ -7,7 +7,9 @@
 #include "driver/rtc_io.h"
 
 #include "BluetoothA2DPSource.h"
+#include "BluetoothA2DPSink.h"
 #include "options.h"
+#include "driver/gpio.h"
 
 static constexpr int kSampleRateHz = A2DP_SAMPLE_RATE_HZ;
 
@@ -19,25 +21,269 @@ static constexpr int kSampleRateHz = A2DP_SAMPLE_RATE_HZ;
 static constexpr size_t kPcmRingBytes = (size_t)PCM_RING_BYTES;
 
 BluetoothA2DPSource a2dp_source;
+BluetoothA2DPSink a2dp_sink;
 
 static const char *kTag = "BT_TX";
+
+enum class BridgeOpMode : uint8_t { TX = 0, RX = 1 };
+static BridgeOpMode s_opMode = BridgeOpMode::TX;
+static bool s_rxSinkStarted = false;
+static bool s_i2sSlaveRxInstalled = false;
+static char s_rxLocalName[64] = A2DP_RX_LOCAL_NAME;
+static volatile uint8_t s_swVol = 127;  // 0..127 (AVRCP / UART VOL)
+static char s_metaTitle[96] = "";
+static char s_metaArtist[96] = "";
 
 #if CTRL_UART_ENABLE
 static HardwareSerial s_ctrlSerial(1);
 static String s_ctrlLine;
 #endif
 
+static TaskHandle_t s_i2sTask = nullptr;
+static volatile bool s_i2sTaskStopped = true;
+
+static void ctrlPrintln(const char *line) {
+#if CTRL_UART_ENABLE
+  if (line) s_ctrlSerial.println(line);
+#endif
+}
+
+static void i2sSharedPinsSafeInput() {
+  const int pins[] = {I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_OUT_PIN};
+  for (int p : pins) {
+    gpio_reset_pin((gpio_num_t)p);
+    pinMode(p, INPUT);
+    gpio_pullup_dis((gpio_num_t)p);
+    gpio_pulldown_dis((gpio_num_t)p);
+  }
+}
+
+static void publishMetaUart() {
+#if CTRL_UART_ENABLE
+  if (s_metaTitle[0]) {
+    s_ctrlSerial.printf("META title=%s\n", s_metaTitle);
+  }
+  if (s_metaArtist[0]) {
+    s_ctrlSerial.printf("META artist=%s\n", s_metaArtist);
+  }
+#endif
+}
+
+static void setMetaTitle(const char *t) {
+  if (!t) return;
+  strlcpy(s_metaTitle, t, sizeof(s_metaTitle));
+  publishMetaUart();
+}
+
+static void setMetaArtist(const char *a) {
+  if (!a) return;
+  strlcpy(s_metaArtist, a, sizeof(s_metaArtist));
+  publishMetaUart();
+}
+
+static void i2sSlaveRxStop() {
+#if USE_I2S_INPUT
+  if (s_i2sTask) {
+    i2s_stop(I2S_NUM_0);
+    const uint32_t t0 = millis();
+    while (!s_i2sTaskStopped && (millis() - t0) < 800) delay(10);
+  }
+  if (s_i2sSlaveRxInstalled) {
+    i2s_driver_uninstall(I2S_NUM_0);
+    s_i2sSlaveRxInstalled = false;
+  }
+#endif
+  i2sSharedPinsSafeInput();
+}
+
+static bool i2sSlaveRxStart() {
+#if !USE_I2S_INPUT
+  return false;
+#else
+  if (s_i2sSlaveRxInstalled) return true;
+
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_SLAVE | I2S_MODE_RX);
+  cfg.sample_rate = kSampleRateHz;
+  cfg.bits_per_sample = (I2S_IN_BITS == 32) ? I2S_BITS_PER_SAMPLE_32BIT : I2S_BITS_PER_SAMPLE_16BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count = 6;
+  cfg.dma_buf_len = 256;
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = false;
+  cfg.fixed_mclk = 0;
+
+  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr) != ESP_OK) return false;
+
+  i2s_pin_config_t pins = {};
+  pins.bck_io_num = I2S_BCK_PIN;
+  pins.ws_io_num = I2S_WS_PIN;
+  pins.data_out_num = I2S_PIN_NO_CHANGE;
+  pins.data_in_num = I2S_DATA_IN_PIN;
+  if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) {
+    i2s_driver_uninstall(I2S_NUM_0);
+    return false;
+  }
+
+  s_i2sSlaveRxInstalled = true;
+  s_i2sTaskStopped = false;
+  xTaskCreatePinnedToCore(i2s_reader_task, "i2s_reader", 4096, nullptr, 2, &s_i2sTask, 1);
+  return true;
+#endif
+}
+
+static bool s_i2sMasterTxInstalled = false;
+
+static bool i2sMasterTxStart(uint32_t sampleRateHz) {
+  if (s_i2sMasterTxInstalled) return true;
+
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  cfg.sample_rate = (int)sampleRateHz;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count = 8;
+  cfg.dma_buf_len = 256;
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = true;
+  cfg.fixed_mclk = 0;
+
+  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr) != ESP_OK) return false;
+
+  i2s_pin_config_t pins = {};
+  pins.bck_io_num = I2S_BCK_PIN;
+  pins.ws_io_num = I2S_WS_PIN;
+  pins.data_out_num = I2S_DATA_OUT_PIN;
+  pins.data_in_num = I2S_PIN_NO_CHANGE;
+  if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) {
+    i2s_driver_uninstall(I2S_NUM_0);
+    return false;
+  }
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  i2s_start(I2S_NUM_0);
+  s_i2sMasterTxInstalled = true;
+  return true;
+}
+
+static void i2sMasterTxStop() {
+  if (!s_i2sMasterTxInstalled) return;
+  i2s_stop(I2S_NUM_0);
+  i2s_driver_uninstall(I2S_NUM_0);
+  s_i2sMasterTxInstalled = false;
+  i2sSharedPinsSafeInput();
+}
+
+static void applySwVolume(int16_t *lr, size_t nSamples) {
+  if (s_swVol >= 127) return;
+  if (s_swVol == 0) {
+    memset(lr, 0, nSamples * sizeof(int16_t));
+    return;
+  }
+  for (size_t i = 0; i < nSamples; i++) {
+    int32_t v = ((int32_t)lr[i] * (int32_t)s_swVol) / 127;
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    lr[i] = (int16_t)v;
+  }
+}
+
+static void rxStreamToI2s(const uint8_t *data, uint32_t len) {
+  if (!data || len < 4 || !s_i2sMasterTxInstalled) return;
+  const size_t frames = len / 4;
+  static int32_t slotBuf[512 * 2];
+  const size_t maxFrames = sizeof(slotBuf) / (2 * sizeof(int32_t));
+  size_t off = 0;
+  while (off < frames) {
+    const size_t chunk = min(frames - off, maxFrames);
+    int16_t tmp[512 * 2];
+    memcpy(tmp, data + off * 4, chunk * 4);
+    applySwVolume(tmp, chunk * 2);
+    for (size_t i = 0; i < chunk * 2; i++) {
+#if I2S_32BIT_USE_MSB16
+      slotBuf[i] = ((int32_t)tmp[i]) << 16;
+#else
+      slotBuf[i] = (int32_t)(uint16_t)tmp[i];
+#endif
+    }
+    size_t written = 0;
+    i2s_write(I2S_NUM_0, slotBuf, chunk * 8, &written, portMAX_DELAY);
+    off += chunk;
+  }
+}
+
+static void rxSinkStop() {
+  if (!s_rxSinkStarted) return;
+  a2dp_sink.end(true);
+  s_rxSinkStarted = false;
+  i2sMasterTxStop();
+}
+
+static bool rxSinkStart(const char *name) {
+  if (!name || !name[0]) name = s_rxLocalName;
+  strlcpy(s_rxLocalName, name, sizeof(s_rxLocalName));
+
+  rxSinkStop();
+  btStopGraceful(true);
+  i2sSlaveRxStop();
+
+  if (!i2sMasterTxStart(44100)) {
+    Serial.println("[RX] I2S master TX install failed");
+    return false;
+  }
+
+  a2dp_sink.set_stream_reader(rxStreamToI2s, false);
+  a2dp_sink.set_avrc_metadata_callback([](uint8_t id, const uint8_t *text) {
+    if (!text) return;
+    if (id == ESP_AVRC_MD_ATTR_TITLE) setMetaTitle((const char *)text);
+    else if (id == ESP_AVRC_MD_ATTR_ARTIST) setMetaArtist((const char *)text);
+  });
+  a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST);
+  a2dp_sink.set_on_volumechange([](int v) {
+    if (v < 0) v = 0;
+    if (v > 127) v = 127;
+    s_swVol = (uint8_t)v;
+#if CTRL_UART_ENABLE
+    s_ctrlSerial.printf("VOL %u\n", (unsigned)s_swVol);
+#endif
+  });
+  a2dp_sink.set_volume(s_swVol);
+  a2dp_sink.start(s_rxLocalName);
+  s_rxSinkStarted = true;
+  s_opMode = BridgeOpMode::RX;
+  s_lastUseMs = millis();
+  return true;
+}
+
+static bool enterTxBridgeMode() {
+  rxSinkStop();
+  s_metaTitle[0] = s_metaArtist[0] = '\0';
+  s_opMode = BridgeOpMode::TX;
+  if (!i2sSlaveRxStart()) {
+    Serial.println("[TX] I2S slave RX restart failed");
+    return false;
+  }
+  ctrlPrintln("OK MODE_TX");
+  ctrlPrintln("BUS_HIGROW_RELEASED");
+  return true;
+}
+
 static char s_sinkName[64] = A2DP_SINK_NAME;
 static bool s_btStarted = false;
 static uint32_t s_lastUseMs = 0;
 static volatile bool s_shuttingDown = false;
-static TaskHandle_t s_i2sTask = nullptr;
-static volatile bool s_i2sTaskStopped = true;
 
 // The ProS3 can switch stream sample rates (podcasts are often 48kHz).
 // A2DP (SBC) output in this project is fixed to kSampleRateHz, so when the input
 // rate differs we resample into the PCM ring buffer to avoid pitch shift/clicks.
 static volatile uint32_t s_inPcmHz = (uint32_t)kSampleRateHz;
+
+#if USE_I2S_INPUT
+static void i2s_reader_task(void *arg);
+#endif
 
 #if USE_I2S_INPUT
 // Forward declaration: ring_write is defined below, but used by the resampler helper.
@@ -185,19 +431,10 @@ static void btStart(const char *name) {
 static void enterDeepSleep() {
   Serial.println("[SLEEP] preparing deep sleep");
   s_shuttingDown = true;
+  rxSinkStop();
   btStopGraceful(true);
-
-#if USE_I2S_INPUT
-  // Stop I2S driver to reduce leakage and avoid surprises on wake.
-  if (s_i2sTask) {
-    i2s_stop(I2S_NUM_0);
-    const uint32_t t0 = millis();
-    while (!s_i2sTaskStopped && (millis() - t0) < 800) {
-      delay(10);
-    }
-  }
-  i2s_driver_uninstall(I2S_NUM_0);
-#endif
+  i2sSlaveRxStop();
+  i2sMasterTxStop();
 
   // Configure ext0 wake on WAKE_PIN.
   const gpio_num_t wakeGpio = (gpio_num_t)WAKE_PIN;
@@ -429,44 +666,14 @@ void setup() {
   esp_log_level_set("RCCT", ESP_LOG_INFO);
 
 #if USE_I2S_INPUT
-  Serial.println("Mode: I2S input -> A2DP (bridge)");
-  Serial.printf("I2S pins: BCK=%d WS=%d DIN=%d\n", I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_IN_PIN);
+  Serial.println("Mode: I2S input -> A2DP (bridge) [TX default]");
+  Serial.printf("I2S pins: BCK=%d WS=%d DIN/DOUT=%d\n", I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_IN_PIN);
   Serial.printf("Expected PCM (A2DP): %d Hz, 16-bit stereo\n", kSampleRateHz);
   Serial.printf("I2S input: %d-bit slots (32-bit will be downconverted)\n", (int)I2S_IN_BITS);
-
-  // Configure I2S as SLAVE RX (clocks provided by upstream device).
-  i2s_config_t cfg = {};
-  cfg.mode = (i2s_mode_t)(I2S_MODE_SLAVE | I2S_MODE_RX);
-  cfg.sample_rate = kSampleRateHz;
-  cfg.bits_per_sample = (I2S_IN_BITS == 32) ? I2S_BITS_PER_SAMPLE_32BIT : I2S_BITS_PER_SAMPLE_16BIT;
-  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
-  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  cfg.dma_buf_count = 6;
-  cfg.dma_buf_len = 256;
-  cfg.use_apll = false;
-  cfg.tx_desc_auto_clear = false;
-  cfg.fixed_mclk = 0;
-
-  const esp_err_t i2s_ok = i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
-  if (i2s_ok != ESP_OK) {
-    Serial.printf("I2S install failed: %d\n", (int)i2s_ok);
+  if (!i2sSlaveRxStart()) {
+    Serial.println("I2S slave RX init failed");
     while (true) delay(1000);
   }
-
-  i2s_pin_config_t pins = {};
-  pins.bck_io_num = I2S_BCK_PIN;
-  pins.ws_io_num = I2S_WS_PIN;
-  pins.data_out_num = I2S_PIN_NO_CHANGE;
-  pins.data_in_num = I2S_DATA_IN_PIN;
-  const esp_err_t pin_ok = i2s_set_pin(I2S_NUM_0, &pins);
-  if (pin_ok != ESP_OK) {
-    Serial.printf("I2S set_pin failed: %d\n", (int)pin_ok);
-    while (true) delay(1000);
-  }
-
-  s_i2sTaskStopped = false;
-  xTaskCreatePinnedToCore(i2s_reader_task, "i2s_reader", 4096, nullptr, 2, &s_i2sTask, 1);
 #else
   Serial.println("Mode: generated sine test tone -> A2DP");
 #endif
@@ -549,12 +756,70 @@ static void handleCtrlLine(const String &line) {
   }
 
   if (cmd == "HELP") {
-    s_ctrlSerial.println("OK cmds: PING, STATUS, CONNECT <name>, DISCONNECT, BT_ON, BT_OFF, SR <hz>, SLEEP");
+    s_ctrlSerial.println("OK cmds: PING, STATUS, CONNECT <name>, DISCONNECT, BT_ON, BT_OFF, SR <hz>, SLEEP, "
+                         "HANDOVER PROS3_RELEASED, MODE TX, MODE RX <name>, VOL <0-127>");
+    return;
+  }
+
+  if (cmd == "HANDOVER") {
+    if (arg.equalsIgnoreCase("PROS3_RELEASED")) {
+      btStopGraceful(true);
+      i2sSlaveRxStop();
+      i2sMasterTxStop();
+      i2sSharedPinsSafeInput();
+      s_ctrlSerial.println("OK HIGROW_ARMED");
+      return;
+    }
+    s_ctrlSerial.println("ERR unknown handover");
+    return;
+  }
+
+  if (cmd == "MODE") {
+    if (arg.equalsIgnoreCase("TX")) {
+      if (!enterTxBridgeMode()) s_ctrlSerial.println("ERR mode_tx");
+      return;
+    }
+    if (arg.startsWith("RX")) {
+      String name = arg.substring(2);
+      name.trim();
+      if (name.startsWith(" ")) name = name.substring(1);
+      if (name.isEmpty()) name = s_rxLocalName;
+      if (!rxSinkStart(name.c_str())) {
+        s_ctrlSerial.println("ERR mode_rx");
+        return;
+      }
+      s_ctrlSerial.println("OK MODE_RX");
+      s_ctrlSerial.println("BUS_HIGROW_MASTER");
+      return;
+    }
+    s_ctrlSerial.println("ERR mode usage");
+    return;
+  }
+
+  if (cmd == "VOL") {
+    if (arg.isEmpty()) {
+      s_ctrlSerial.println("ERR missing vol");
+      return;
+    }
+    int v = arg.toInt();
+    if (v < 0) v = 0;
+    if (v > 127) v = 127;
+    s_swVol = (uint8_t)v;
+    if (s_rxSinkStarted) a2dp_sink.set_volume(s_swVol);
+    s_ctrlSerial.printf("OK vol=%u\n", (unsigned)s_swVol);
     return;
   }
 
   if (cmd == "STATUS") {
-    s_ctrlSerial.printf("STATUS conn=%d audio=%d bt=%d sr=%u ring=%u i2sB=%u underrunB=%u overrunB=%u peak=%u dc=%u\n",
+    if (s_opMode == BridgeOpMode::RX) {
+      s_ctrlSerial.printf("STATUS mode=rx conn=%d audio=%d bt=%d vol=%u\n",
+                          (int)a2dp_sink.get_connection_state(),
+                          (int)a2dp_sink.get_audio_state(),
+                          (int)(s_rxSinkStarted ? 1 : 0),
+                          (unsigned)s_swVol);
+      return;
+    }
+    s_ctrlSerial.printf("STATUS mode=tx conn=%d audio=%d bt=%d sr=%u ring=%u i2sB=%u underrunB=%u overrunB=%u peak=%u dc=%u\n",
                         (int)a2dp_source.get_connection_state(),
                         (int)a2dp_source.get_audio_state(),
                         (int)(s_btStarted ? 1 : 0),
@@ -592,6 +857,10 @@ static void handleCtrlLine(const String &line) {
   }
 
   if (cmd == "CONNECT") {
+    if (s_opMode == BridgeOpMode::RX) {
+      s_ctrlSerial.println("ERR wrong mode (use MODE TX)");
+      return;
+    }
     if (arg.isEmpty()) {
       s_ctrlSerial.println("ERR missing name");
       return;
@@ -645,8 +914,8 @@ void loop() {
   }
 #endif
 
-  // Auto-sleep when idle (default internal speaker mode).
-  if (!s_btStarted && AUTO_SLEEP_IDLE_MS > 0) {
+  // Auto-sleep when idle (TX bridge only; never sleep during RX sink mode).
+  if (s_opMode == BridgeOpMode::TX && !s_btStarted && AUTO_SLEEP_IDLE_MS > 0) {
     const uint32_t now = millis();
     if ((uint32_t)(now - s_lastUseMs) >= AUTO_SLEEP_IDLE_MS) {
       Serial.println("[SLEEP] idle timeout");

@@ -95,3 +95,13 @@
 #define I2S_32BIT_USE_MSB16 1
 #endif
 
+// -------- A2DP sink (RX) mode: phone -> HiGrow -> I2S master -> DAC --------
+#ifndef A2DP_RX_LOCAL_NAME
+#define A2DP_RX_LOCAL_NAME "yoRadio Fusion"
+#endif
+
+// I2S master TX data pin (shared DIN net with ProS3 / MAX98357).
+#ifndef I2S_DATA_OUT_PIN
+#define I2S_DATA_OUT_PIN I2S_DATA_IN_PIN
+#endif
+

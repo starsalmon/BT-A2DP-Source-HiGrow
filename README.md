@@ -50,6 +50,11 @@ Commands:
 - `BT_OFF` → disconnect + `end(true)` (release memory)
 - `BT_ON` → start again with last name
 - `SR <hz>` → set the **upstream PCM sample rate** on the I2S lines (`44100` or `48000`)
+- `HANDOVER PROS3_RELEASED` → ProS3 has tri-stated I2S pins; HiGrow replies `OK HIGROW_ARMED`
+- `MODE RX <name>` → A2DP **sink** + I2S **master TX** to the shared DAC (`OK MODE_RX`, `BUS_HIGROW_MASTER`)
+- `MODE TX` → return to I2S slave RX bridge (`OK MODE_TX`, `BUS_HIGROW_RELEASED`)
+- `VOL <0-127>` → software/AVRCP volume while in RX mode
+- `META title=...` / `META artist=...` → track metadata (RX mode)
   - A2DP output is fixed to **44.1kHz**; when `SR 48000` is set, the bridge resamples **48k → 44.1k** before encoding
 - `SLEEP` → disconnect + deep sleep (wake on `WAKE_PIN`)
 
