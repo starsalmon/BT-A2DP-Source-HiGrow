@@ -34,6 +34,18 @@ static volatile uint8_t s_swVol = 127;  // 0..127 (AVRCP / UART VOL)
 static char s_metaTitle[96] = "";
 static char s_metaArtist[96] = "";
 
+static char s_sinkName[64] = A2DP_SINK_NAME;
+static bool s_btStarted = false;
+static uint32_t s_lastUseMs = 0;
+static volatile bool s_shuttingDown = false;
+
+#if USE_I2S_INPUT
+static void i2s_reader_task(void *arg);
+#endif
+
+static void btStopGraceful(bool releaseMemory);
+static void btStart(const char *name);
+
 #if CTRL_UART_ENABLE
 static HardwareSerial s_ctrlSerial(1);
 static String s_ctrlLine;
@@ -271,19 +283,10 @@ static bool enterTxBridgeMode() {
   return true;
 }
 
-static char s_sinkName[64] = A2DP_SINK_NAME;
-static bool s_btStarted = false;
-static uint32_t s_lastUseMs = 0;
-static volatile bool s_shuttingDown = false;
-
 // The ProS3 can switch stream sample rates (podcasts are often 48kHz).
 // A2DP (SBC) output in this project is fixed to kSampleRateHz, so when the input
 // rate differs we resample into the PCM ring buffer to avoid pitch shift/clicks.
 static volatile uint32_t s_inPcmHz = (uint32_t)kSampleRateHz;
-
-#if USE_I2S_INPUT
-static void i2s_reader_task(void *arg);
-#endif
 
 #if USE_I2S_INPUT
 // Forward declaration: ring_write is defined below, but used by the resampler helper.
