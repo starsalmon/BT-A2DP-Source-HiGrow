@@ -340,7 +340,6 @@ static bool rxSinkStart(const char *name) {
 #endif
   });
   a2dp_sink.set_volume(s_swVol);
-  a2dp_sink.set_auto_reconnect(true, 30);
   a2dp_sink.start(s_rxLocalName);
   s_rxSinkStarted = true;
   s_opMode = BridgeOpMode::RX;
