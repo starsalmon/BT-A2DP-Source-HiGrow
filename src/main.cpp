@@ -812,7 +812,7 @@ static void handleCtrlLine(const String &line) {
 
   if (cmd == "HELP") {
     s_ctrlSerial.println("OK cmds: PING, STATUS, CONNECT <name>, DISCONNECT, BT_ON, BT_OFF, SR <hz>, SLEEP, "
-                         "HANDOVER PROS3_RELEASED, MODE TX, MODE RX <name>, VOL <0-127>");
+                         "HANDOVER PROS3_RELEASED, MODE TX, MODE RX <name>, VOL <0-127>, AVRCP TOGGLE|PLAY|PAUSE");
     return;
   }
 
@@ -848,6 +848,35 @@ static void handleCtrlLine(const String &line) {
       return;
     }
     s_ctrlSerial.println("ERR mode usage");
+    return;
+  }
+
+  if (cmd == "AVRCP") {
+    if (s_opMode != BridgeOpMode::RX || !s_rxSinkStarted) {
+      s_ctrlSerial.println("ERR avrcp wrong mode");
+      return;
+    }
+    if (arg.equalsIgnoreCase("TOGGLE")) {
+      if (a2dp_sink.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED) {
+        a2dp_sink.pause();
+        s_ctrlSerial.println("OK avrcp_pause");
+      } else {
+        a2dp_sink.play();
+        s_ctrlSerial.println("OK avrcp_play");
+      }
+      return;
+    }
+    if (arg.equalsIgnoreCase("PLAY")) {
+      a2dp_sink.play();
+      s_ctrlSerial.println("OK avrcp_play");
+      return;
+    }
+    if (arg.equalsIgnoreCase("PAUSE")) {
+      a2dp_sink.pause();
+      s_ctrlSerial.println("OK avrcp_pause");
+      return;
+    }
+    s_ctrlSerial.println("ERR avrcp usage");
     return;
   }
 
