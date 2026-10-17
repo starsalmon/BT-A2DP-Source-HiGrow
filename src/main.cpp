@@ -12,6 +12,8 @@
 #include "options.h"
 #include "driver/gpio.h"
 #include "esp_avrc_api.h"
+#include "esp_bt_main.h"
+#include "esp_gap_bt_api.h"
 
 static constexpr int kSampleRateHz = A2DP_SAMPLE_RATE_HZ;
 
@@ -275,17 +277,30 @@ static void rxSinkStop() {
   if (!s_rxSinkStarted) return;
   s_rxSinkStarted = false;
   Serial.println("[RX] sink stop");
-  a2dp_sink.end(true);
+  // fix8: end(false). end(true) calls esp_bt_controller_mem_release(CLASSIC_BT) and sets
+  // is_start_disabled, so any later sink/source start in this awake session silently failed
+  // (HiGrow reported "rx bt=1" but was unconnectable until a reset).
+  a2dp_sink.end(false);
   delay(50);
   i2sMasterTxStop();
 }
 
+static bool rxSinkAlive() {
+  return s_rxSinkStarted && esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED;
+}
+
 static bool rxSinkStart(const char *name) {
   if (!name || !name[0]) name = s_rxLocalName;
+  // fix8: MODE RX while the sink is already running (same name) must not restart it
+  // (that drops the phone). Just confirm.
+  if (s_opMode == BridgeOpMode::RX && rxSinkAlive() && strcmp(name, s_rxLocalName) == 0) {
+    Serial.println("[RX] sink already running; MODE RX is a no-op");
+    return true;
+  }
   strlcpy(s_rxLocalName, name, sizeof(s_rxLocalName));
 
   rxSinkStop();
-  btStopGraceful(true);
+  btStopGraceful(false);   // fix8: keep BT memory so the sink can start
   i2sSlaveRxStop();
 
   s_rxI2sWriteBytes = 0;
@@ -305,6 +320,15 @@ static bool rxSinkStart(const char *name) {
                           : (state == ESP_A2D_CONNECTION_STATE_CONNECTING) ? "CONNECTING"
                           : (state == ESP_A2D_CONNECTION_STATE_DISCONNECTING) ? "DISCONNECTING"
                           : "DISCONNECTED");
+        if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+          // fix8: drop -> forget stale metadata and be connectable/discoverable again.
+          s_metaTitle[0] = s_metaArtist[0] = '\0';
+          esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+#if CTRL_UART_ENABLE
+          s_ctrlSerial.println("META title=");
+          s_ctrlSerial.println("META artist=");
+#endif
+        }
       },
       nullptr);
   a2dp_sink.set_on_audio_state_changed(
@@ -341,6 +365,12 @@ static bool rxSinkStart(const char *name) {
   });
   a2dp_sink.set_volume(s_swVol);
   a2dp_sink.start(s_rxLocalName);
+  if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
+    Serial.println("[RX] sink start FAILED (BT stack not enabled) -> restarting HiGrow");
+    s_ctrlSerial.println("ERR bt_dead restarting");
+    delay(100);
+    esp_restart();
+  }
   s_rxSinkStarted = true;
   s_opMode = BridgeOpMode::RX;
   s_lastUseMs = millis();
@@ -930,7 +960,7 @@ static void handleCtrlLine(const String &line) {
       s_ctrlSerial.printf("STATUS mode=rx conn=%d audio=%d bt=%d vol=%u\n",
                           (int)a2dp_sink.get_connection_state(),
                           (int)a2dp_sink.get_audio_state(),
-                          (int)(s_rxSinkStarted ? 1 : 0),
+                          (int)(rxSinkAlive() ? 1 : 0),
                           (unsigned)s_swVol);
       // ProS3 polls STATUS often; re-send cached metadata so the UI catches up after handover.
       publishMetaUart();
