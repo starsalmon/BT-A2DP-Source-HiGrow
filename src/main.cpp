@@ -14,6 +14,8 @@
 #include "esp_avrc_api.h"
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
+#include "esp_bt.h"
+#include "esp_heap_caps.h"
 
 static constexpr int kSampleRateHz = A2DP_SAMPLE_RATE_HZ;
 
@@ -52,6 +54,16 @@ static void i2s_reader_task(void *arg);
 
 static void btStopGraceful(bool releaseMemory);
 static void btStart(const char *name);
+
+// fix10: internal DRAM heap stats (free / all-time min free / largest contiguous block).
+// The BT host mallocs every inbound ACL packet; when that fails it asserts (hci_hal_h4.c:639).
+static constexpr uint32_t kHeapCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+static void logHeap(const char *where) {
+  Serial.printf("[HEAP] %s free=%u min=%u largest=%u\n", where,
+                (unsigned)heap_caps_get_free_size(kHeapCaps),
+                (unsigned)heap_caps_get_minimum_free_size(kHeapCaps),
+                (unsigned)heap_caps_get_largest_free_block(kHeapCaps));
+}
 
 #if CTRL_UART_ENABLE
 static HardwareSerial s_ctrlSerial(1);
@@ -129,6 +141,11 @@ static void requestAvrcMetadata() {
   Serial.printf("[RX] META request mask=0x%02x err=%d\n", (unsigned)mask, (int)err);
 }
 
+#if USE_I2S_INPUT
+static bool ringAlloc();
+static void ringFree();
+#endif
+
 static void i2sSlaveRxStop() {
 #if USE_I2S_INPUT
   if (s_i2sTask != nullptr || s_i2sSlaveRxInstalled) {
@@ -152,6 +169,7 @@ static void i2sSlaveRxStop() {
     i2s_driver_uninstall(I2S_NUM_0);
     s_i2sSlaveRxInstalled = false;
   }
+  ringFree();  // fix10: reader task is gone; give the 64 KB back for RX / BT
 #endif
   i2sSharedPinsSafeInput();
 }
@@ -165,6 +183,7 @@ static bool i2sSlaveRxStart() {
     i2s_driver_uninstall(I2S_NUM_0);
     s_i2sSlaveRxInstalled = false;
   }
+  if (!ringAlloc()) return false;  // fix10: TX PCM ring lives on the heap only while in TX
 
   i2s_config_t cfg = {};
   cfg.mode = (i2s_mode_t)(I2S_MODE_SLAVE | I2S_MODE_RX);
@@ -179,7 +198,10 @@ static bool i2sSlaveRxStart() {
   cfg.tx_desc_auto_clear = false;
   cfg.fixed_mclk = 0;
 
-  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr) != ESP_OK) return false;
+  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr) != ESP_OK) {
+    ringFree();
+    return false;
+  }
 
   i2s_pin_config_t pins = {};
   pins.bck_io_num = I2S_BCK_PIN;
@@ -188,6 +210,7 @@ static bool i2sSlaveRxStart() {
   pins.data_in_num = I2S_DATA_IN_PIN;
   if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) {
     i2s_driver_uninstall(I2S_NUM_0);
+    ringFree();
     return false;
   }
 
@@ -395,6 +418,7 @@ static bool rxSinkStart(const char *name) {
   s_opMode = BridgeOpMode::RX;
   s_lastUseMs = millis();
   Serial.printf("[RX] sink started name='%s' vol=%u\n", s_rxLocalName, (unsigned)s_swVol);
+  logHeap("rx_sink_started");
   return true;
 }
 
@@ -583,7 +607,11 @@ static void enterDeepSleep() {
 }
 
 #if USE_I2S_INPUT
-static uint8_t s_ring[kPcmRingBytes];
+// fix10: the TX PCM ring (PCM_RING_BYTES, 64 KB) used to be a static array, i.e. 64 KB of DRAM
+// held permanently, also in RX mode where the A2DP sink + Bluedroid need that heap. It is now
+// malloc'd when TX (I2S slave RX) starts and freed when it stops. See ringAlloc()/ringFree().
+static uint8_t *s_ring = nullptr;
+static size_t s_ringCap = 0;
 static size_t s_ring_r = 0;
 static size_t s_ring_w = 0;
 static size_t s_ring_fill = 0;
@@ -603,25 +631,29 @@ static uint32_t s_pcm_dc_abs = 0;
 static void ring_write(const uint8_t *data, size_t len) {
   if (len == 0) return;
   portENTER_CRITICAL(&s_ring_mux);
+  if (!s_ring) {
+    portEXIT_CRITICAL(&s_ring_mux);
+    return;
+  }
 
   // If overflow, drop oldest data to make room.
-  if (len > kPcmRingBytes) {
-    data += (len - kPcmRingBytes);
-    len = kPcmRingBytes;
+  if (len > s_ringCap) {
+    data += (len - s_ringCap);
+    len = s_ringCap;
   }
-  if (len > (kPcmRingBytes - s_ring_fill)) {
-    const size_t need = len - (kPcmRingBytes - s_ring_fill);
-    s_ring_r = (s_ring_r + need) % kPcmRingBytes;
+  if (len > (s_ringCap - s_ring_fill)) {
+    const size_t need = len - (s_ringCap - s_ring_fill);
+    s_ring_r = (s_ring_r + need) % s_ringCap;
     s_ring_fill -= need;
     s_ring_overrun_bytes += need;
   }
 
-  const size_t first = min(len, kPcmRingBytes - s_ring_w);
+  const size_t first = min(len, s_ringCap - s_ring_w);
   memcpy(&s_ring[s_ring_w], data, first);
   const size_t rem = len - first;
   if (rem) memcpy(&s_ring[0], data + first, rem);
 
-  s_ring_w = (s_ring_w + len) % kPcmRingBytes;
+  s_ring_w = (s_ring_w + len) % s_ringCap;
   s_ring_fill += len;
 
   portEXIT_CRITICAL(&s_ring_mux);
@@ -632,14 +664,19 @@ static size_t ring_read(uint8_t *out, size_t len) {
   size_t got = 0;
 
   portENTER_CRITICAL(&s_ring_mux);
+  if (!s_ring) {  // fix10: not in TX mode (ring not allocated) -> silence
+    portEXIT_CRITICAL(&s_ring_mux);
+    memset(out, 0, len);
+    return len;
+  }
   got = min(len, s_ring_fill);
 
-  const size_t first = min(got, kPcmRingBytes - s_ring_r);
+  const size_t first = min(got, s_ringCap - s_ring_r);
   memcpy(out, &s_ring[s_ring_r], first);
   const size_t rem = got - first;
   if (rem) memcpy(out + first, &s_ring[0], rem);
 
-  s_ring_r = (s_ring_r + got) % kPcmRingBytes;
+  s_ring_r = (s_ring_r + got) % s_ringCap;
   s_ring_fill -= got;
   portEXIT_CRITICAL(&s_ring_mux);
 
@@ -648,6 +685,47 @@ static size_t ring_read(uint8_t *out, size_t len) {
     s_ring_underrun_bytes += (len - got);
   }
   return len;
+}
+
+// fix10: allocate the TX ring from the largest internal DRAM block. Full PCM_RING_BYTES when it
+// fits (always at boot, before BT starts); otherwise halve down to 16 KB rather than fail TX.
+static bool ringAlloc() {
+  if (s_ring) return true;
+  size_t want = kPcmRingBytes;
+  uint8_t *p = nullptr;
+  while (want >= 16 * 1024) {
+    if (heap_caps_get_largest_free_block(kHeapCaps) >= want) {
+      p = (uint8_t *)heap_caps_malloc(want, kHeapCaps);
+      if (p) break;
+    }
+    want /= 2;
+  }
+  if (!p) {
+    Serial.println("[TX] PCM ring alloc FAILED");
+    logHeap("ring_alloc_fail");
+    return false;
+  }
+  portENTER_CRITICAL(&s_ring_mux);
+  s_ring = p;
+  s_ringCap = want;
+  s_ring_r = s_ring_w = s_ring_fill = 0;
+  portEXIT_CRITICAL(&s_ring_mux);
+  Serial.printf("[TX] PCM ring %u B allocated%s\n", (unsigned)want,
+                (want < kPcmRingBytes) ? " (reduced)" : "");
+  return true;
+}
+
+static void ringFree() {
+  portENTER_CRITICAL(&s_ring_mux);
+  uint8_t *p = s_ring;
+  s_ring = nullptr;
+  s_ringCap = 0;
+  s_ring_r = s_ring_w = s_ring_fill = 0;
+  portEXIT_CRITICAL(&s_ring_mux);
+  if (p) {
+    heap_caps_free(p);
+    Serial.println("[TX] PCM ring freed");
+  }
 }
 
 static void i2s_reader_task(void *) {
@@ -785,6 +863,15 @@ void setup() {
 
   Serial.println();
   Serial.println("A2DP Source test (ESP32 Classic BT required)");
+  logHeap("boot");
+  // fix10: Classic BT only (A2DP source/sink + AVRCP); nothing here uses BLE. Release the BLE
+  // controller memory before any BT init. (The Arduino core's btStartMode(CLASSIC_BT) does the
+  // same on first start; doing it here makes it explicit and gets it back before anything else.)
+  {
+    const esp_err_t e = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+    Serial.printf("[BOOT] BLE controller mem release err=%d\n", (int)e);
+    logHeap("after_ble_release");
+  }
   Serial.print("Default target sink name: ");
   Serial.println(A2DP_SINK_NAME);
   Serial.println("Put your speaker/headphones in pairing mode now (or control via UART).");
@@ -1106,14 +1193,17 @@ void loop() {
       const uint32_t total = s_rxI2sWriteBytes;
       const uint32_t delta = total - last_rx_i2s_bytes;
       last_rx_i2s_bytes = total;
-      Serial.printf("[RX] conn=%d audio=%d i2s_tx=+%uB (total %u) drop=%u sr=%u vol=%u\n",
+      Serial.printf("[RX] conn=%d audio=%d i2s_tx=+%uB (total %u) drop=%u sr=%u vol=%u heap=%u min=%u blk=%u\n",
                     (int)a2dp_sink.get_connection_state(),
                     (int)a2dp_sink.get_audio_state(),
                     (unsigned)delta,
                     (unsigned)total,
                     (unsigned)s_rxI2sDropBytes,
                     (unsigned)s_rxI2sSampleRateHz,
-                    (unsigned)s_swVol);
+                    (unsigned)s_swVol,
+                    (unsigned)heap_caps_get_free_size(kHeapCaps),
+                    (unsigned)heap_caps_get_minimum_free_size(kHeapCaps),
+                    (unsigned)heap_caps_get_largest_free_block(kHeapCaps));
     }
     static uint32_t last_meta_poll_ms = 0;
     if (a2dp_sink.get_connection_state() == ESP_A2D_CONNECTION_STATE_CONNECTED &&
@@ -1154,7 +1244,7 @@ void loop() {
                   (int)a2dp_source.get_connection_state(),
                   (int)a2dp_source.get_audio_state(),
                   (unsigned)fill,
-                  (unsigned)kPcmRingBytes,
+                  (unsigned)s_ringCap,
                   (unsigned)di2s,
                   (unsigned)s_i2s_read_calls,
                   (unsigned)s_i2s_zero_reads,
