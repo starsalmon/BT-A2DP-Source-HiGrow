@@ -22,6 +22,15 @@
 #define HIGROW_LOG_CTRL 1
 #endif
 
+// -------- TEST: start BT RX (A2DP sink) at boot without the ProS3 --------
+// 1 = behave as if UART "MODE RX <HIGROW_AUTOSTART_RX_NAME>" arrived right after boot.
+#ifndef HIGROW_AUTOSTART_RX
+#define HIGROW_AUTOSTART_RX 1
+#endif
+#ifndef HIGROW_AUTOSTART_RX_NAME
+#define HIGROW_AUTOSTART_RX_NAME "yoRadio Fusion"
+#endif
+
 // -------- Audio source mode --------
 // 1 = I2S input -> A2DP bridge, 0 = generated sine tone.
 #ifndef USE_I2S_INPUT

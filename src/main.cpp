@@ -785,6 +785,13 @@ void setup() {
 
   Serial.println();
   Serial.println("A2DP Source test (ESP32 Classic BT required)");
+  {
+    const esp_reset_reason_t rr = esp_reset_reason();
+    static const char *const kRR[] = {"UNKNOWN", "POWERON", "EXT", "SW", "PANIC", "INT_WDT",
+                                      "TASK_WDT", "WDT", "DEEPSLEEP", "BROWNOUT", "SDIO"};
+    Serial.printf("[BOOT] reset_reason=%d (%s)\n", (int)rr,
+                  ((int)rr >= 0 && (int)rr < (int)(sizeof(kRR) / sizeof(kRR[0]))) ? kRR[(int)rr] : "?");
+  }
   Serial.print("Default target sink name: ");
   Serial.println(A2DP_SINK_NAME);
   Serial.println("Put your speaker/headphones in pairing mode now (or control via UART).");
@@ -857,6 +864,19 @@ void setup() {
   });
 
   // Try connecting (the library actively scans and connects to the sink name)
+#if HIGROW_AUTOSTART_RX
+  // TEST: same path as UART "MODE RX <name>", so the sink runs without the ProS3.
+  Serial.printf("[BOOT] HIGROW_AUTOSTART_RX=1 -> MODE RX '%s'\n", HIGROW_AUTOSTART_RX_NAME);
+  if (rxSinkStart(HIGROW_AUTOSTART_RX_NAME)) {
+#if CTRL_UART_ENABLE
+    s_ctrlSerial.println("OK MODE_RX");
+    s_ctrlSerial.println("BUS_HIGROW_MASTER");
+#endif
+  } else {
+    Serial.println("[BOOT] autostart MODE RX failed");
+  }
+  return;
+#endif
   if (AUTO_CONNECT_ON_BOOT) {
     btStart(s_sinkName);
   } else {
