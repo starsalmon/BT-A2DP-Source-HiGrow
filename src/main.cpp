@@ -34,6 +34,7 @@ static BridgeOpMode s_opMode = BridgeOpMode::TX;
 static bool s_rxSinkStarted = false;
 static volatile uint32_t s_rxI2sWriteBytes = 0;
 static uint32_t s_rxI2sSampleRateHz = 44100;
+static volatile uint32_t s_rxI2sDropBytes = 0;  // fix9: PCM dropped instead of blocking the BT task
 static bool s_i2sSlaveRxInstalled = false;
 static char s_rxLocalName[64] = A2DP_RX_LOCAL_NAME;
 static volatile uint8_t s_swVol = 127;  // 0..127 (AVRCP / UART VOL)
@@ -115,6 +116,13 @@ static void setMetaArtist(const char *a) {
 
 static void requestAvrcMetadata() {
   if (!s_rxSinkStarted) return;
+  // fix9: only with AVRCP connected, and at most once per 3 s (was: every STATUS poll + audio
+  // start + track change + 15 s poll, all with the same transaction label, often in a burst).
+  if (!a2dp_sink.is_avrc_connected()) return;
+  static uint32_t s_lastMetaReqMs = 0;
+  const uint32_t nowMs = millis();
+  if (s_lastMetaReqMs != 0 && (uint32_t)(nowMs - s_lastMetaReqMs) < 3000UL) return;
+  s_lastMetaReqMs = nowMs | 1u;
   const uint8_t mask = ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST;
   const esp_err_t err =
       esp_avrc_ct_send_metadata_cmd(APP_RC_CT_TL_GET_META_DATA, mask);
@@ -253,6 +261,11 @@ static void rxStreamToI2s(const uint8_t *data, uint32_t len) {
   const size_t frames = len / 4;
   static int32_t slotBuf[512 * 2];
   const size_t maxFrames = sizeof(slotBuf) / (2 * sizeof(int32_t));
+  // fix9: this runs in the Bluedroid A2DP data callback (BT stack task). Never block it
+  // indefinitely: a stalled/slow I2S (or the phone's start-of-stream burst) used to park the
+  // BT task in i2s_write(portMAX_DELAY), starving AVDTP/L2CAP signalling -> phone drops the
+  // link right as audio starts while the HiGrow still believes it is connected.
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(40);
   size_t off = 0;
   while (off < frames) {
     const size_t chunk = min(frames - off, maxFrames);
@@ -267,8 +280,11 @@ static void rxStreamToI2s(const uint8_t *data, uint32_t len) {
 #endif
     }
     size_t written = 0;
-    i2s_write(I2S_NUM_0, slotBuf, chunk * 8, &written, portMAX_DELAY);
+    const TickType_t nowT = xTaskGetTickCount();
+    const TickType_t wait = (nowT < deadline) ? (deadline - nowT) : 0;
+    i2s_write(I2S_NUM_0, slotBuf, chunk * 8, &written, wait);
     s_rxI2sWriteBytes += written;
+    if (written < chunk * 8) { s_rxI2sDropBytes += (frames - off) * 4; break; }  // drop, don't stall BT
     off += chunk;
   }
 }
@@ -323,7 +339,8 @@ static bool rxSinkStart(const char *name) {
         if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
           // fix8: drop -> forget stale metadata and be connectable/discoverable again.
           s_metaTitle[0] = s_metaArtist[0] = '\0';
-          esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+          // fix9: no esp_bt_gap_set_scan_mode() here; the library already sets connectable on
+          // DISCONNECTED (and handles its reconnect attempts), and forcing it raced that logic.
 #if CTRL_UART_ENABLE
           s_ctrlSerial.println("META title=");
           s_ctrlSerial.println("META artist=");
@@ -347,6 +364,9 @@ static bool rxSinkStart(const char *name) {
   a2dp_sink.set_avrc_rn_track_change_callback([](uint8_t *) { requestAvrcMetadata(); });
   a2dp_sink.set_sample_rate_callback([](uint16_t rate) {
     s_rxI2sSampleRateHz = rate;
+    // fix9: actually retune the I2S clock. Before, a 48 kHz SBC stream was played out at
+    // 44.1 kHz, so data arrived ~9% faster than I2S drained it and the BT task backed up.
+    if (s_i2sMasterTxInstalled) i2s_set_sample_rates(I2S_NUM_0, rate);
     Serial.printf("[RX] sample_rate=%u Hz\n", (unsigned)rate);
   });
   a2dp_sink.set_avrc_metadata_callback([](uint8_t id, const uint8_t *text) {
@@ -963,10 +983,7 @@ static void handleCtrlLine(const String &line) {
                           (int)(rxSinkAlive() ? 1 : 0),
                           (unsigned)s_swVol);
       // ProS3 polls STATUS often; re-send cached metadata so the UI catches up after handover.
-      publishMetaUart();
-      if (a2dp_sink.get_connection_state() == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-        requestAvrcMetadata();
-      }
+      publishMetaUart();   // fix9: replay cache only; no AVRC request per STATUS poll
       return;
     }
     s_ctrlSerial.printf("STATUS mode=tx conn=%d audio=%d bt=%d sr=%u ring=%u i2sB=%u underrunB=%u overrunB=%u peak=%u dc=%u\n",
@@ -1089,11 +1106,12 @@ void loop() {
       const uint32_t total = s_rxI2sWriteBytes;
       const uint32_t delta = total - last_rx_i2s_bytes;
       last_rx_i2s_bytes = total;
-      Serial.printf("[RX] conn=%d audio=%d i2s_tx=+%uB (total %u) sr=%u vol=%u\n",
+      Serial.printf("[RX] conn=%d audio=%d i2s_tx=+%uB (total %u) drop=%u sr=%u vol=%u\n",
                     (int)a2dp_sink.get_connection_state(),
                     (int)a2dp_sink.get_audio_state(),
                     (unsigned)delta,
                     (unsigned)total,
+                    (unsigned)s_rxI2sDropBytes,
                     (unsigned)s_rxI2sSampleRateHz,
                     (unsigned)s_swVol);
     }
