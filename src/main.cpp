@@ -42,6 +42,13 @@ static char s_rxLocalName[64] = A2DP_RX_LOCAL_NAME;
 static volatile uint8_t s_swVol = 127;  // 0..127 (AVRCP / UART VOL)
 static char s_metaTitle[96] = "";
 static char s_metaArtist[96] = "";
+// fix11: album + track length (AVRCP attr 0x04 / 0x40) and play position / status.
+static char s_metaAlbum[96] = "";
+static volatile uint32_t s_trackLenMs = 0;     // 0 = unknown (some apps don't send it)
+static volatile uint32_t s_posMs = 0;          // last reported play position
+static volatile uint32_t s_posAtMs = 0;        // millis() when s_posMs was reported
+static volatile int8_t s_playing = -1;         // -1 unknown, 0 paused/stopped, 1 playing
+static volatile bool s_posDirty = false;       // POS changed since last UART POS line
 
 static char s_sinkName[64] = A2DP_SINK_NAME;
 static bool s_btStarted = false;
@@ -109,7 +116,36 @@ static void publishMetaUart() {
     Serial.printf("[RX] META artist=%s\n", s_metaArtist);
     s_ctrlSerial.printf("META artist=%s\n", s_metaArtist);
   }
+  if (s_metaAlbum[0]) {
+    s_ctrlSerial.printf("META album=%s\n", s_metaAlbum);
+  }
 #endif
+}
+
+// fix11: elapsed position now (extrapolated while playing), clamped to the track length.
+static uint32_t posNowMs() {
+  uint32_t p = s_posMs;
+  if (s_playing == 1 && s_posAtMs) p += (uint32_t)(millis() - s_posAtMs);
+  if (s_trackLenMs && p > s_trackLenMs) p = s_trackLenMs;
+  return p;
+}
+
+// fix11: "POS <elapsed_ms> <total_ms> <playing 0/1>" (total 0 = unknown length).
+static void publishPosUart() {
+#if CTRL_UART_ENABLE
+  s_ctrlSerial.printf("POS %u %u %d\n", (unsigned)posNowMs(), (unsigned)s_trackLenMs,
+                      (s_playing == 1) ? 1 : 0);
+#endif
+  s_posDirty = false;
+}
+
+static void clearTrackExtras() {
+  s_metaAlbum[0] = '\0';
+  s_trackLenMs = 0;
+  s_posMs = 0;
+  s_posAtMs = 0;
+  s_playing = -1;
+  s_posDirty = false;
 }
 
 static void setMetaTitle(const char *t) {
@@ -126,6 +162,30 @@ static void setMetaArtist(const char *a) {
   publishMetaUart();
 }
 
+// fix11: album / length only go out when they change (STATUS replay covers late joiners), so
+// the 15 s metadata refresh doesn't add UART lines or ProS3 redraws.
+static void setMetaAlbum(const char *a) {
+  if (!a) return;
+  char tmp[sizeof(s_metaAlbum)];
+  strlcpy(tmp, a, sizeof(tmp));
+  sanitizeMetaField(tmp, sizeof(tmp));
+  if (strcmp(tmp, s_metaAlbum) == 0) return;
+  strlcpy(s_metaAlbum, tmp, sizeof(s_metaAlbum));
+  Serial.printf("[RX] META album=%s\n", s_metaAlbum);
+#if CTRL_UART_ENABLE
+  s_ctrlSerial.printf("META album=%s\n", s_metaAlbum);
+#endif
+}
+
+static void setTrackLen(const char *msText) {
+  if (!msText) return;
+  const uint32_t ms = (uint32_t)strtoul(msText, nullptr, 10);
+  if (ms == s_trackLenMs) return;
+  s_trackLenMs = ms;
+  Serial.printf("[RX] track length=%u ms\n", (unsigned)ms);
+  s_posDirty = true;
+}
+
 static void requestAvrcMetadata() {
   if (!s_rxSinkStarted) return;
   // fix9: only with AVRCP connected, and at most once per 3 s (was: every STATUS poll + audio
@@ -135,7 +195,8 @@ static void requestAvrcMetadata() {
   const uint32_t nowMs = millis();
   if (s_lastMetaReqMs != 0 && (uint32_t)(nowMs - s_lastMetaReqMs) < 3000UL) return;
   s_lastMetaReqMs = nowMs | 1u;
-  const uint8_t mask = ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST;
+  const uint8_t mask = ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST | ESP_AVRC_MD_ATTR_ALBUM |
+                       ESP_AVRC_MD_ATTR_PLAYING_TIME;  // fix11: + album, length
   const esp_err_t err =
       esp_avrc_ct_send_metadata_cmd(APP_RC_CT_TL_GET_META_DATA, mask);
   Serial.printf("[RX] META request mask=0x%02x err=%d\n", (unsigned)mask, (int)err);
@@ -344,6 +405,7 @@ static bool rxSinkStart(const char *name) {
 
   s_rxI2sWriteBytes = 0;
   s_metaTitle[0] = s_metaArtist[0] = '\0';
+  clearTrackExtras();
   if (!i2sMasterTxStart(44100)) {
     Serial.println("[RX] I2S master TX install failed");
     return false;
@@ -351,7 +413,8 @@ static bool rxSinkStart(const char *name) {
   Serial.printf("[RX] I2S master TX bck=%d ws=%d dout=%d sr=%u 32bit_slots\n",
                 I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_OUT_PIN, (unsigned)s_rxI2sSampleRateHz);
 
-  a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST);
+  a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
+                                             ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME);
   a2dp_sink.set_stream_reader(rxStreamToI2s, false);
   a2dp_sink.set_on_connection_state_changed(
       [](esp_a2d_connection_state_t state, void *) {
@@ -362,11 +425,14 @@ static bool rxSinkStart(const char *name) {
         if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
           // fix8: drop -> forget stale metadata and be connectable/discoverable again.
           s_metaTitle[0] = s_metaArtist[0] = '\0';
+  clearTrackExtras();
           // fix9: no esp_bt_gap_set_scan_mode() here; the library already sets connectable on
           // DISCONNECTED (and handles its reconnect attempts), and forcing it raced that logic.
 #if CTRL_UART_ENABLE
           s_ctrlSerial.println("META title=");
           s_ctrlSerial.println("META artist=");
+          s_ctrlSerial.println("META album=");
+          s_ctrlSerial.println("POS 0 0 0");
 #endif
         }
       },
@@ -378,13 +444,45 @@ static bool rxSinkStart(const char *name) {
         if (state == ESP_A2D_AUDIO_STATE_STARTED) {
           requestAvrcMetadata();
         }
+        // fix11: stream state as a fallback for play status (AVRCP status overrides it).
+        const int8_t pl = (state == ESP_A2D_AUDIO_STATE_STARTED) ? 1 : 0;
+        if (pl != s_playing) {
+          s_posMs = posNowMs();
+          s_posAtMs = millis();
+          s_playing = pl;
+          s_posDirty = true;
+        }
       },
       nullptr);
   a2dp_sink.set_avrc_connection_state_callback([](bool connected) {
     Serial.printf("[RX] AVRC %s\n", connected ? "CONNECTED" : "DISCONNECTED");
     if (connected) requestAvrcMetadata();
   });
-  a2dp_sink.set_avrc_rn_track_change_callback([](uint8_t *) { requestAvrcMetadata(); });
+  a2dp_sink.set_avrc_rn_track_change_callback([](uint8_t *) {
+    s_posMs = 0;                 // fix11: new track starts at 0; length comes with the metadata
+    s_posAtMs = millis();
+    s_posDirty = true;
+    requestAvrcMetadata();
+  });
+  // fix11: AVRCP play status (playing / paused / stopped) and 1 s play-position notifications.
+  // Both are registered by the library once the phone reports the capability; they are tiny
+  // AVRCP packets (no heap growth), and the UART POS line is rate-limited in loop().
+  a2dp_sink.set_avrc_rn_playstatus_callback([](esp_avrc_playback_stat_t st) {
+    const int8_t pl = (st == ESP_AVRC_PLAYBACK_PLAYING) ? 1 : 0;
+    s_posMs = posNowMs();
+    s_posAtMs = millis();
+    s_playing = pl;
+    s_posDirty = true;
+    Serial.printf("[RX] play status=%d\n", (int)st);
+  });
+  a2dp_sink.set_avrc_rn_play_pos_callback(
+      [](uint32_t pos) {
+        if (pos == 0xFFFFFFFFu) return;  // "no track selected"
+        s_posMs = pos;
+        s_posAtMs = millis();
+        s_posDirty = true;
+      },
+      1);
   a2dp_sink.set_sample_rate_callback([](uint16_t rate) {
     s_rxI2sSampleRateHz = rate;
     // fix9: actually retune the I2S clock. Before, a 48 kHz SBC stream was played out at
@@ -397,6 +495,8 @@ static bool rxSinkStart(const char *name) {
     Serial.printf("[RX] AVRC metadata attr=0x%02x text='%s'\n", (unsigned)id, (const char *)text);
     if (id == ESP_AVRC_MD_ATTR_TITLE || id == 0x01) setMetaTitle((const char *)text);
     else if (id == ESP_AVRC_MD_ATTR_ARTIST || id == 0x02) setMetaArtist((const char *)text);
+    else if (id == ESP_AVRC_MD_ATTR_ALBUM) setMetaAlbum((const char *)text);
+    else if (id == ESP_AVRC_MD_ATTR_PLAYING_TIME) setTrackLen((const char *)text);
   });
   a2dp_sink.set_on_volumechange([](int v) {
     if (v < 0) v = 0;
@@ -425,6 +525,7 @@ static bool rxSinkStart(const char *name) {
 static bool enterTxBridgeMode() {
   rxSinkStop();
   s_metaTitle[0] = s_metaArtist[0] = '\0';
+  clearTrackExtras();
   s_opMode = BridgeOpMode::TX;
   if (!i2sSlaveRxStart()) {
     Serial.println("[TX] I2S slave RX restart failed");
@@ -1071,6 +1172,8 @@ static void handleCtrlLine(const String &line) {
                           (unsigned)s_swVol);
       // ProS3 polls STATUS often; re-send cached metadata so the UI catches up after handover.
       publishMetaUart();   // fix9: replay cache only; no AVRC request per STATUS poll
+      if (s_rxSinkStarted && a2dp_sink.get_connection_state() == ESP_A2D_CONNECTION_STATE_CONNECTED)
+        publishPosUart();  // fix11
       return;
     }
     s_ctrlSerial.printf("STATUS mode=tx conn=%d audio=%d bt=%d sr=%u ring=%u i2sB=%u underrunB=%u overrunB=%u peak=%u dc=%u\n",
@@ -1193,7 +1296,7 @@ void loop() {
       const uint32_t total = s_rxI2sWriteBytes;
       const uint32_t delta = total - last_rx_i2s_bytes;
       last_rx_i2s_bytes = total;
-      Serial.printf("[RX] conn=%d audio=%d i2s_tx=+%uB (total %u) drop=%u sr=%u vol=%u heap=%u min=%u blk=%u\n",
+      Serial.printf("[RX] conn=%d audio=%d i2s_tx=+%uB (total %u) drop=%u sr=%u vol=%u heap=%u min=%u blk=%u pos=%u/%u pl=%d\n",
                     (int)a2dp_sink.get_connection_state(),
                     (int)a2dp_sink.get_audio_state(),
                     (unsigned)delta,
@@ -1203,7 +1306,16 @@ void loop() {
                     (unsigned)s_swVol,
                     (unsigned)heap_caps_get_free_size(kHeapCaps),
                     (unsigned)heap_caps_get_minimum_free_size(kHeapCaps),
-                    (unsigned)heap_caps_get_largest_free_block(kHeapCaps));
+                    (unsigned)heap_caps_get_largest_free_block(kHeapCaps),
+                    (unsigned)posNowMs(), (unsigned)s_trackLenMs, (int)s_playing);
+    }
+    // fix11: POS to the ProS3 at most 1/s, only when something changed (position
+    // notification, play/pause, track change, new length). The ProS3 interpolates in between.
+    static uint32_t last_pos_ms = 0;
+    if (s_posDirty && (uint32_t)(now - last_pos_ms) >= 1000UL &&
+        a2dp_sink.get_connection_state() == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+      last_pos_ms = now;
+      publishPosUart();
     }
     static uint32_t last_meta_poll_ms = 0;
     if (a2dp_sink.get_connection_state() == ESP_A2D_CONNECTION_STATE_CONNECTED &&
