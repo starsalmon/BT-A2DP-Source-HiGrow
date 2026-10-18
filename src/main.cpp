@@ -25,19 +25,7 @@ static constexpr int kSampleRateHz = A2DP_SAMPLE_RATE_HZ;
 static constexpr size_t kPcmRingBytes = (size_t)PCM_RING_BYTES;
 
 BluetoothA2DPSource a2dp_source;
-#if HIGROW_NO_META
-// TEST (HIGROW_NO_META): the library's av_new_track() always sends GET_ELEMENT_ATTRIBUTES and
-// re-registers RN events after AVRC caps arrive / on track change. Make those no-ops.
-class NoMetaA2DPSink : public BluetoothA2DPSink {
- protected:
-  void av_new_track() override {}
-  void av_playback_changed() override {}
-  void av_play_pos_changed() override {}
-};
-NoMetaA2DPSink a2dp_sink;
-#else
 BluetoothA2DPSink a2dp_sink;
-#endif
 
 static const char *kTag = "BT_TX";
 
@@ -127,9 +115,6 @@ static void setMetaArtist(const char *a) {
 }
 
 static void requestAvrcMetadata() {
-#if HIGROW_NO_META
-  return;
-#endif
   if (!s_rxSinkStarted) return;
   // fix9: only with AVRCP connected, and at most once per 3 s (was: every STATUS poll + audio
   // start + track change + 15 s poll, all with the same transaction label, often in a burst).
@@ -343,11 +328,7 @@ static bool rxSinkStart(const char *name) {
   Serial.printf("[RX] I2S master TX bck=%d ws=%d dout=%d sr=%u 32bit_slots\n",
                 I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_OUT_PIN, (unsigned)s_rxI2sSampleRateHz);
 
-#if !HIGROW_NO_META
   a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST);
-#else
-  Serial.println("[RX] HIGROW_NO_META=1: AVRCP metadata disabled (test build)");
-#endif
   a2dp_sink.set_stream_reader(rxStreamToI2s, false);
   a2dp_sink.set_on_connection_state_changed(
       [](esp_a2d_connection_state_t state, void *) {
@@ -380,9 +361,7 @@ static bool rxSinkStart(const char *name) {
     Serial.printf("[RX] AVRC %s\n", connected ? "CONNECTED" : "DISCONNECTED");
     if (connected) requestAvrcMetadata();
   });
-#if !HIGROW_NO_META
   a2dp_sink.set_avrc_rn_track_change_callback([](uint8_t *) { requestAvrcMetadata(); });
-#endif
   a2dp_sink.set_sample_rate_callback([](uint16_t rate) {
     s_rxI2sSampleRateHz = rate;
     // fix9: actually retune the I2S clock. Before, a 48 kHz SBC stream was played out at
@@ -390,14 +369,12 @@ static bool rxSinkStart(const char *name) {
     if (s_i2sMasterTxInstalled) i2s_set_sample_rates(I2S_NUM_0, rate);
     Serial.printf("[RX] sample_rate=%u Hz\n", (unsigned)rate);
   });
-#if !HIGROW_NO_META
   a2dp_sink.set_avrc_metadata_callback([](uint8_t id, const uint8_t *text) {
     if (!text || !text[0]) return;
     Serial.printf("[RX] AVRC metadata attr=0x%02x text='%s'\n", (unsigned)id, (const char *)text);
     if (id == ESP_AVRC_MD_ATTR_TITLE || id == 0x01) setMetaTitle((const char *)text);
     else if (id == ESP_AVRC_MD_ATTR_ARTIST || id == 0x02) setMetaArtist((const char *)text);
   });
-#endif
   a2dp_sink.set_on_volumechange([](int v) {
     if (v < 0) v = 0;
     if (v > 127) v = 127;

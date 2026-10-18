@@ -22,14 +22,6 @@
 #define HIGROW_LOG_CTRL 1
 #endif
 
-// -------- TEST: disable all AVRCP metadata activity --------
-// 1 = no metadata callback, no GET_ELEMENT_ATTRIBUTES requests (ours or the library's),
-//     no AVRCP CT notification registrations (track/play-status/play-pos).
-//     Basic AVRCP stays: CT/TG init, passthrough play/pause, absolute volume (TG).
-#ifndef HIGROW_NO_META
-#define HIGROW_NO_META 1
-#endif
-
 // -------- Audio source mode --------
 // 1 = I2S input -> A2DP bridge, 0 = generated sine tone.
 #ifndef USE_I2S_INPUT
