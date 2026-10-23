@@ -16,6 +16,7 @@
 #include "esp_gap_bt_api.h"
 #include "esp_bt.h"
 #include "esp_heap_caps.h"
+#include <Preferences.h>
 
 static constexpr int kSampleRateHz = A2DP_SAMPLE_RATE_HZ;
 
@@ -52,6 +53,7 @@ static volatile bool s_posDirty = false;       // POS changed since last UART PO
 
 static char s_sinkName[64] = A2DP_SINK_NAME;
 static bool s_btStarted = false;
+static char s_btStartedName[64] = "";  // fix12: target the running stack was started for
 static uint32_t s_lastUseMs = 0;
 static volatile bool s_shuttingDown = false;
 
@@ -667,20 +669,57 @@ static void btStopGraceful(bool releaseMemory) {
   delay(250);
   a2dp_source.end(releaseMemory);
   s_btStarted = false;
+  s_btStartedName[0] = '\0';
   Serial.println("[BT] stopped");
   s_lastUseMs = millis();
+}
+
+// fix12: TX connect reliability.
+// - The radio re-sends CONNECT about every 60 s while conn=0. Restarting the stack each time aborted any
+//   inquiry/pairing in progress, so a repeat CONNECT for the same name while BT is running is a no-op.
+// - First BT start in TX: release the 64 KB PCM ring (stop I2S slave RX) *before* Bluedroid/A2DP
+//   init, then re-take it. fix10 took the ring at boot, ahead of BT init, carving the largest
+//   internal block out from under the BT stack.
+// - Auto-reconnect to the last sink (fast path); the saved peer is cleared when the target name changes.
+static void btPrepareTarget(const char *name) {
+  Preferences prefs;
+  if (prefs.begin("hgtx", false)) {
+    String last = prefs.getString("name", "");
+    if (!last.equalsIgnoreCase(name)) {
+      Serial.printf("[BT] target changed '%s' -> '%s': clearing saved peer\n", last.c_str(), name);
+      a2dp_source.clean_last_connection();
+      prefs.putString("name", name);
+    }
+    prefs.end();
+  }
+  a2dp_source.set_auto_reconnect(true);
 }
 
 static void btStart(const char *name) {
   if (!name || !name[0]) return;
   if (s_btStarted) {
-    // If already running, do a clean restart to re-scan from scratch.
+    if (strcasecmp(s_btStartedName, name) == 0) {
+      Serial.printf("[BT] already running for '%s' (conn=%d), not restarting\n", name,
+                    (int)a2dp_source.is_connected());
+      s_lastUseMs = millis();
+      return;
+    }
+    // Different target: clean restart to re-scan from scratch.
     btStopGraceful(false);
     delay(150);
   }
+  btPrepareTarget(name);
+  const bool txI2s = (s_opMode == BridgeOpMode::TX) && s_i2sSlaveRxInstalled;
+  if (txI2s) i2sSlaveRxStop();  // frees the PCM ring so BT init gets the big block
+  logHeap("bt_pre_start");
   Serial.printf("[BT] starting, target='%s'\n", name);
   a2dp_source.start(name);
   s_btStarted = true;
+  strncpy(s_btStartedName, name, sizeof(s_btStartedName) - 1);
+  s_btStartedName[sizeof(s_btStartedName) - 1] = '\0';
+  Serial.printf("[BT] bluedroid status=%d (2=enabled)\n", (int)esp_bluedroid_get_status());
+  logHeap("bt_post_start");
+  if (txI2s && !i2sSlaveRxStart()) Serial.println("[TX] I2S slave RX restart after BT start FAILED");
   s_lastUseMs = millis();
 }
 
