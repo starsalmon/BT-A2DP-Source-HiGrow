@@ -1,63 +1,60 @@
-## BT-A2DP-Source-HiGrow
+## BT-A2DP-Source-HiGrow: Bluetooth companion for yoRadio Fusion
 
-Standalone **Bluetooth A2DP Source (transmitter)** test for an **ESP32 (Classic BT)** board (e.g. LilyGo HiGrow).
+Classic-Bluetooth ESP32 firmware that gives an ESP32-S3 yoRadio (no Classic BT) A2DP in both directions:
 
-### What it does
-- Connects to a Bluetooth speaker/headphones (A2DP Sink) by name
-- Streams audio as an **A2DP Source**:
-  - Default: **I2S input → A2DP** bridge (expects 44.1kHz, 16-bit, stereo)
-  - Optional fallback: generate a 440Hz sine wave (compile-time)
-- Exposes a simple **UART control protocol** so another MCU (e.g. ProS3) can
-  `CONNECT`/`DISCONNECT` and put the ESP32 into deep sleep cleanly.
+- **TX / send**: I2S slave input from the radio -> A2DP source to BT headphones/speaker (`CONNECT <name>`).
+  A2DP is fixed at 44.1 kHz; with `SR 48000` the bridge resamples 48k -> 44.1k.
+- **RX / receive**: A2DP sink for a phone (`MODE RX <name>`), I2S master into the radio's DAC after
+  the bus handover. Title/artist go back to the radio as `META` lines.
 
-### Requirements
-- A board with **ESP32 (original)** that supports **Classic Bluetooth (BR/EDR)**.
-  - **ESP32-S3 / ESP32-C6 won’t work** for A2DP.
-- PlatformIO
+Controlled by the radio over UART. Command set and handover sequence:
+[`docs/BT_COMPANION.md`](https://github.com/starsalmon/yoRadio-Fusion-ProS3/blob/cursor/multi-device/docs/BT_COMPANION.md)
+in yoRadio-Fusion-ProS3 (moves to `main` with that branch). Send `HELP` for the list on the device.
 
-### Setup
-1. Open this folder in PlatformIO.
-2. Edit `include/options.h` and set:
-   - `#define A2DP_SINK_NAME "Your Speaker Name"`
-   - (Bridge mode) set I2S pins:
-     - `I2S_BCK_PIN`, `I2S_WS_PIN`, `I2S_DATA_IN_PIN`
-3. Put your speaker/headphones into pairing mode.
-4. Build + upload.
+Needs an original ESP32 (BR/EDR). ESP32-S3 / C3 / C6 can't do A2DP.
 
-If it connects, you should hear a steady tone.
+### Boards / envs
 
-### Wiring (bridge mode)
-Connect your audio source’s I2S output to the ESP32:
-- **BCLK** → `I2S_BCK_PIN`
-- **LRCLK/WS** → `I2S_WS_PIN`
-- **DATA out** → `I2S_DATA_IN_PIN`
-- **GND** → **GND**
+| Env | Board | Pins | Used with |
+|-----|-------|------|-----------|
+| `higrow_a2dp_source` (default pin map) | LilyGo HiGrow (`esp32dev`) | UART RX 39 / TX 13, wake 38, I2S BCK 17 / WS 23 / DATA 19 | ProS3 radio |
+| `nodemcu32s_bt_companion` | NodeMCU-32S (`-DCOMPANION_BOARD_NODEMCU32S=1`) | UART TX 17 / RX 16, wake 33, I2S BCK 26 / WS 25 / DATA 22 (**proposed, TBD** pending wiring) | April's Speaker |
 
-The ESP32 is configured as **I2S SLAVE RX** (upstream device provides the clocks).
+Pins live in [`include/options.h`](include/options.h); the Node block only overrides them when
+`COMPANION_BOARD_NODEMCU32S` is set, so the HiGrow build is unchanged. Bluetooth receive name: "yoRadio Fusion"
+(HiGrow) / "April's Speaker" (Node). Default send target `A2DP_SINK_NAME` "HiFi-IIS" (the radio sends
+its own with `CONNECT`). UART 115200; wake is EXT0, level high.
 
-### UART control (recommended)
-This firmware can be controlled by another MCU via UART (line-based, `\n` terminated).
+### Build / upload
 
-Defaults (override with `#define`s in `include/options.h`):
-- **CTRL UART**: `RX=GPIO39` (input-only), `TX=GPIO13`, `115200 baud`
-- **Wake pin**: `GPIO38` (EXT0 wake, level high)
+```bash
+pio run -e higrow_a2dp_source
+pio run -e higrow_a2dp_source -t upload --upload-port <PORT>
+pio run -e nodemcu32s_bt_companion
+```
 
-Commands:
-- `PING` → `PONG`
-- `STATUS` → prints connection/audio state + buffer stats (includes current upstream PCM `sr=...`)
-- `CONNECT <name>` → scan + connect to the first matching sink name
-- `DISCONNECT` → best-effort disconnect (keeps stack ready)
-- `BT_OFF` → disconnect + `end(true)` (release memory)
-- `BT_ON` → start again with last name
-- `SR <hz>` → set the **upstream PCM sample rate** on the I2S lines (`44100` or `48000`)
-- `HANDOVER PROS3_RELEASED` → ProS3 has tri-stated I2S pins; HiGrow replies `OK HIGROW_ARMED`
-- `MODE RX <name>` → A2DP **sink** + I2S **master TX** to the shared DAC (`OK MODE_RX`, `BUS_HIGROW_MASTER`)
-- `MODE TX` → return to I2S slave RX bridge (`OK MODE_TX`, `BUS_HIGROW_RELEASED`)
-- `VOL <0-127>` → software/AVRCP volume while in RX mode
-- `META title=...` / `META artist=...` → track metadata (RX mode)
-  - A2DP output is fixed to **44.1kHz**; when `SR 48000` is set, the bridge resamples **48k → 44.1k** before encoding
-- `SLEEP` → disconnect + deep sleep (wake on `WAKE_PIN`)
+- **HiGrow uploads at 115200** (`upload_speed` and `--baud`): 921600 fails on this board/cable.
+  The Node env uses 460800.
+- This project shares the pioarduino framework under `~/.platformio` with yoRadio. Building it
+  reinstalls the stock framework, so the next yoRadio build re-applies its patches. Check yoRadio's
+  `[fw-guard] ... (OK)` lines before flashing the radio.
+- Keep `src/idf_component.yml` local (not committed).
 
-### Notes (upload/reset)
-If upload fails or the board doesn’t auto-reset cleanly, `platformio.ini` uses explicit `esptool` upload flags (`--before=default_reset`, `--after=hard_reset`, `--baud=921600`) which were confirmed working on at least one HiGrow setup.
+### Memory (fix10)
 
+The TX PCM ring (`PCM_RING_BYTES`, 64 KB) used to be a static array, i.e. 64 KB of DRAM held
+permanently. In RX mode that starved Bluedroid/the A2DP sink (`host_recv_pkt_cb` malloc assert,
+reboot ~4 s after the phone connected). Since fix10 the ring is malloc'd only while TX runs and freed
+when it stops. BLE controller memory is released at boot (Classic only), and `[HEAP]` lines are
+logged at boot, after sink start, and in the 1 s `[RX]` line.
+
+### Pending
+
+- **fix11** (`6760f4b`, local branch `cursor/bt-a2dp-sink-rx-fe2d`, not on main): album and track
+  length metadata, AVRCP play status + position, UART `META album=` and `POS <elapsed_ms> <total_ms> <playing>`.
+- Node ESP32 pins for April's Speaker are a proposal until the wiring is confirmed.
+
+### Other options (`include/options.h`)
+
+`USE_I2S_INPUT 0` = test sine instead of the I2S bridge; `AUTO_SLEEP_IDLE_MS` (30 s in TX with BT off
+and no UART activity); `AUTO_CONNECT_ON_BOOT`; `HIGROW_LOG_*` log switches.

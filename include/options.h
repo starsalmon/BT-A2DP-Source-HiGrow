@@ -6,6 +6,36 @@
 //   -D A2DP_SINK_NAME=\"My Speaker\"
 //   -D I2S_BCK_PIN=17 ...
 
+// -------- Board pin map --------
+// Default (no board flag): LilyGo HiGrow wired to the yoRadio ProS3 (pins in the defaults below).
+// -DCOMPANION_BOARD_NODEMCU32S: generic ESP32-WROOM devkit (NodeMCU-32S) for April's Speaker.
+//   Avoids flash pins 6-11, strapping pins 0/2/5/12/15 and UART0 1/3. GPIO38 (HiGrow wake) is not
+//   broken out on these boards, so wake moves to GPIO33 (RTC-capable for EXT0).
+//   TODO(Cain): pins are a proposal until the April's Speaker wiring is confirmed.
+#if defined(COMPANION_BOARD_NODEMCU32S)
+  #ifndef CTRL_UART_TX_PIN
+  #define CTRL_UART_TX_PIN 17   // -> FeatherS3 UART RX GPIO44 (yoRadio BT_COMPANION_UART_RX)
+  #endif
+  #ifndef CTRL_UART_RX_PIN
+  #define CTRL_UART_RX_PIN 16   // <- FeatherS3 UART TX GPIO43 (BT_COMPANION_UART_TX)
+  #endif
+  #ifndef WAKE_PIN
+  #define WAKE_PIN 33           // <- FeatherS3 GPIO7 wake output (EXT0, active high, pulled down)
+  #endif
+  #ifndef I2S_BCK_PIN
+  #define I2S_BCK_PIN 26        // shared with Pirate Audio BCK (FeatherS3 I2S_BCLK GPIO17)
+  #endif
+  #ifndef I2S_WS_PIN
+  #define I2S_WS_PIN 25         // shared with Pirate Audio LRCK (FeatherS3 I2S_LRC GPIO18)
+  #endif
+  #ifndef I2S_DATA_IN_PIN
+  #define I2S_DATA_IN_PIN 22    // shared with Pirate Audio DIN (FeatherS3 I2S_DOUT GPIO14)
+  #endif
+  #ifndef A2DP_RX_LOCAL_NAME
+  #define A2DP_RX_LOCAL_NAME "April's Speaker"
+  #endif
+#endif
+
 // -------- Target Bluetooth sink name --------
 #ifndef A2DP_SINK_NAME
 #define A2DP_SINK_NAME "HiFi-IIS"
