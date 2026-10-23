@@ -27,7 +27,59 @@ static constexpr int kSampleRateHz = A2DP_SAMPLE_RATE_HZ;
 // - RX can be an input-only pin (default 39)
 static constexpr size_t kPcmRingBytes = (size_t)PCM_RING_BYTES;
 
-BluetoothA2DPSource a2dp_source;
+// fix13: the library's inquiry filter silently drops results that (a) lack the rendering/audio/
+// telephony service bits in their Class of Device or (b) carry no EIR name, before our name
+// callback is ever called. Log every result and match on name (EIR, else BDNAME property)
+// regardless of CoD; CONNECT may also be given a MAC (aa:bb:cc:dd:ee:ff).
+static bool parseMac(const char *s, uint8_t out[6]) {
+  unsigned v[6];
+  if (!s || sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
+  return true;
+}
+static bool hgNameMatch(const char *seen, const char *want);
+class HgA2DPSource : public BluetoothA2DPSource {
+ public:
+  const char *targetName = "";
+ protected:
+  void filter_inquiry_scan_result(esp_bt_gap_cb_param_t *param) override {
+    uint32_t cod = 0;
+    int rssi = -129;
+    uint8_t *eir = nullptr;
+    char name[ESP_BT_GAP_MAX_BDNAME_LEN + 1] = "";
+    for (int i = 0; i < param->disc_res.num_prop; i++) {
+      esp_bt_gap_dev_prop_t *pr = param->disc_res.prop + i;
+      if (pr->type == ESP_BT_GAP_DEV_PROP_COD) cod = *(uint32_t *)pr->val;
+      else if (pr->type == ESP_BT_GAP_DEV_PROP_RSSI) rssi = *(int8_t *)pr->val;
+      else if (pr->type == ESP_BT_GAP_DEV_PROP_EIR) eir = (uint8_t *)pr->val;
+      else if (pr->type == ESP_BT_GAP_DEV_PROP_BDNAME && pr->len > 0) {
+        int n = pr->len < (int)sizeof(name) - 1 ? pr->len : (int)sizeof(name) - 1;
+        memcpy(name, pr->val, n);
+        name[n] = 0;
+      }
+    }
+    if (eir) {
+      uint8_t eirName[ESP_BT_GAP_MAX_BDNAME_LEN + 1] = {0};
+      if (get_name_from_eir(eir, eirName, nullptr) && eirName[0]) strncpy(name, (char *)eirName, sizeof(name) - 1);
+    }
+    const uint8_t *b = param->disc_res.bda;
+    uint8_t mac[6];
+    const bool macMatch = parseMac(targetName, mac) && memcmp(mac, b, 6) == 0;
+    const bool match = macMatch || hgNameMatch(name, targetName);
+    Serial.printf("[BT] found: %02x:%02x:%02x:%02x:%02x:%02x cod=0x%06x rssi=%d eir=%d name='%s'%s\n",
+                  b[0], b[1], b[2], b[3], b[4], b[5], (unsigned)cod, rssi, eir ? 1 : 0, name,
+                  match ? " [MATCH]" : "");
+    if (!match || s_a2d_state == APP_AV_STATE_DISCOVERED) return;
+    strncpy((char *)s_peer_bdname, name[0] ? name : targetName, ESP_BT_GAP_MAX_BDNAME_LEN);
+    s_peer_bdname[ESP_BT_GAP_MAX_BDNAME_LEN] = 0;
+    s_a2d_state = APP_AV_STATE_DISCOVERED;
+    memcpy(peer_bd_addr, b, ESP_BD_ADDR_LEN);
+    set_last_connection(peer_bd_addr);
+    Serial.println("[BT] target found, cancelling discovery -> connect");
+    esp_bt_gap_cancel_discovery();
+  }
+};
+HgA2DPSource a2dp_source;
 BluetoothA2DPSink a2dp_sink;
 
 static const char *kTag = "BT_TX";
@@ -106,6 +158,14 @@ static void sanitizeMetaField(char *dst, size_t dstLen) {
   for (size_t i = 0; dst[i] && i < dstLen; i++) {
     if (dst[i] == '\r' || dst[i] == '\n') dst[i] = ' ';
   }
+}
+
+// fix13: remote (phone) name in RX mode -> "PEER name=<name>" (new line type; older radios ignore it).
+static char s_peerName[ESP_BT_GAP_MAX_BDNAME_LEN + 1] = "";
+static void publishPeerUart() {
+#if CTRL_UART_ENABLE
+  s_ctrlSerial.printf("PEER name=%s\n", s_peerName);
+#endif
 }
 
 static void publishMetaUart() {
@@ -418,6 +478,13 @@ static bool rxSinkStart(const char *name) {
   a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
                                              ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME);
   a2dp_sink.set_stream_reader(rxStreamToI2s, false);
+  a2dp_sink.set_peer_name_callback([](char *name) {
+    strncpy(s_peerName, name ? name : "", sizeof(s_peerName) - 1);
+    s_peerName[sizeof(s_peerName) - 1] = '\0';
+    for (char *c = s_peerName; *c; c++) if (*c == '\r' || *c == '\n') *c = ' ';
+    Serial.printf("[RX] peer name='%s'\n", s_peerName);
+    publishPeerUart();
+  });
   a2dp_sink.set_on_connection_state_changed(
       [](esp_a2d_connection_state_t state, void *) {
         Serial.printf("[RX] A2DP conn %s\n", (state == ESP_A2D_CONNECTION_STATE_CONNECTED) ? "CONNECTED"
@@ -436,6 +503,8 @@ static bool rxSinkStart(const char *name) {
           s_ctrlSerial.println("META album=");
           s_ctrlSerial.println("POS 0 0 0");
 #endif
+          s_peerName[0] = '\0';
+          publishPeerUart();
         }
       },
       nullptr);
@@ -633,6 +702,16 @@ static inline void ring_write_pcm_44k1(int16_t* interleavedLR, size_t frames, ui
 }
 #endif
 
+static bool hgNameMatch(const char *seen, const char *want) {
+  if (!seen || !want) return false;
+  while (*want == ' ') want++;
+  while (*seen == ' ') seen++;
+  size_t n = strlen(want);
+  while (n && want[n - 1] == ' ') n--;
+  if (!n) return false;
+  return strncasecmp(seen, want, n) == 0;
+}
+
 static bool namePrefixMatchI(const char *ssid, const char *want) {
   if (!ssid || !ssid[0] || !want || !want[0]) return false;
   for (size_t i = 0; want[i]; i++) {
@@ -665,8 +744,10 @@ static void btStopGraceful(bool releaseMemory) {
   Serial.println("[BT] stopping...");
   // Best-effort disconnect. Some speakers will still show "connected" until their own timeout
   // if we hard-power-off without a clean disconnect.
-  a2dp_source.set_connected(false);
-  delay(250);
+  if (a2dp_source.is_connected()) {  // fix13: set_connected(false) on a never-connected link crashed in btc_av
+    a2dp_source.set_connected(false);
+    delay(250);
+  }
   a2dp_source.end(releaseMemory);
   s_btStarted = false;
   s_btStartedName[0] = '\0';
@@ -691,7 +772,11 @@ static void btPrepareTarget(const char *name) {
       prefs.putString("name", name);
     }
     prefs.end();
+  } else {
+    Serial.println("[BT] prefs open failed: clearing saved peer");
+    a2dp_source.clean_last_connection();
   }
+  a2dp_source.targetName = s_sinkName;
   a2dp_source.set_auto_reconnect(true);
 }
 
@@ -1211,6 +1296,7 @@ static void handleCtrlLine(const String &line) {
                           (unsigned)s_swVol);
       // ProS3 polls STATUS often; re-send cached metadata so the UI catches up after handover.
       publishMetaUart();   // fix9: replay cache only; no AVRC request per STATUS poll
+      if (s_peerName[0]) publishPeerUart();  // fix13
       if (s_rxSinkStarted && a2dp_sink.get_connection_state() == ESP_A2D_CONNECTION_STATE_CONNECTED)
         publishPosUart();  // fix11
       return;
