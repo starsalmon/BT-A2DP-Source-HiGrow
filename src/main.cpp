@@ -578,6 +578,7 @@ static bool rxSinkStart(const char *name) {
 #endif
   });
   a2dp_sink.set_volume(s_swVol);
+  actual_bluetooth_a2dp_common = &a2dp_sink;  // fix14: see btStart()
   a2dp_sink.start(s_rxLocalName);
   if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
     Serial.println("[RX] sink start FAILED (BT stack not enabled) -> restarting HiGrow");
@@ -798,6 +799,11 @@ static void btStart(const char *name) {
   if (txI2s) i2sSlaveRxStop();  // frees the PCM ring so BT init gets the big block
   logHeap("bt_pre_start");
   Serial.printf("[BT] starting, target='%s'\n", name);
+  // fix14 ROOT CAUSE: the library's app task dispatches via the global actual_bluetooth_a2dp_common,
+  // which each A2DP object's constructor overwrites. a2dp_sink is constructed after a2dp_source,
+  // so the source's BtAppT ran the *sink's* handler (queue null -> "app_task_queue is null" forever):
+  // STACK_UP never ran, discovery never started, TX could never connect. Point it at the active object.
+  actual_bluetooth_a2dp_common = &a2dp_source;
   a2dp_source.start(name);
   s_btStarted = true;
   strncpy(s_btStartedName, name, sizeof(s_btStartedName) - 1);
