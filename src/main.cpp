@@ -1099,6 +1099,8 @@ static int32_t hg_a2d_data_cb(uint8_t *data, int32_t len) {
 }
 
 void setup() {
+  // Shared I2S nets (BCK/WS/DATA also driven by the host S3): high-impedance until a mode starts.
+  i2sSharedPinsSafeInput();
   Serial.begin(115200);
   delay(300);
   s_lastUseMs = millis();

@@ -11,13 +11,14 @@
 // -DCOMPANION_BOARD_NODEMCU32S: generic ESP32-WROOM devkit (NodeMCU-32S) for April's Speaker.
 //   Avoids flash pins 6-11, strapping pins 0/2/5/12/15 and UART0 1/3. GPIO38 (HiGrow wake) is not
 //   broken out on these boards, so wake moves to GPIO33 (RTC-capable for EXT0).
-//   TODO(Cain): pins are a proposal until the April's Speaker wiring is confirmed.
+//   Pins chosen 2026-10-24 (Cain: "you choose"); see yoRadio docs/APRILS_SPEAKER.md + wiring PDF.
+//   Node EN <- FeatherS3 GPIO9 and Node IO0 <- FeatherS3 GPIO8 (open-drain, for reset + flashing via the S3).
 #if defined(COMPANION_BOARD_NODEMCU32S)
   #ifndef CTRL_UART_TX_PIN
-  #define CTRL_UART_TX_PIN 17   // -> FeatherS3 UART RX GPIO44 (yoRadio BT_COMPANION_UART_RX)
+  #define CTRL_UART_TX_PIN 17   // -> FeatherS3 UART1 RX GPIO16 (yoRadio BT_COMPANION_UART_RX)
   #endif
   #ifndef CTRL_UART_RX_PIN
-  #define CTRL_UART_RX_PIN 16   // <- FeatherS3 UART TX GPIO43 (BT_COMPANION_UART_TX)
+  #define CTRL_UART_RX_PIN 16   // <- FeatherS3 UART1 TX GPIO15 (BT_COMPANION_UART_TX)
   #endif
   #ifndef WAKE_PIN
   #define WAKE_PIN 33           // <- FeatherS3 GPIO7 wake output (EXT0, active high, pulled down)
