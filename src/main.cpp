@@ -856,6 +856,8 @@ static int s_i2s_last_err = 0;
 static uint32_t s_ring_overrun_bytes = 0;
 static uint32_t s_ring_underrun_bytes = 0;
 static uint32_t s_a2dp_cb_calls = 0;
+static volatile uint32_t s_a2dp_cb_raw = 0;  // diag: every library call, before guards
+static volatile int32_t s_a2dp_cb_lastLen = 0;
 static uint32_t s_pcm_peak = 0;
 static uint32_t s_pcm_dc_abs = 0;
 
@@ -1062,6 +1064,8 @@ static float s_phase = 0.0f;
 static int32_t get_sound_data(uint8_t *data, int32_t byteCount) {
 #if USE_I2S_INPUT
   // The A2DP stack may call this during shutdown; be defensive.
+  s_a2dp_cb_raw++;
+  s_a2dp_cb_lastLen = byteCount;
   if (!data || byteCount <= 0 || s_shuttingDown || !s_btStarted) return 0;
   s_a2dp_cb_calls++;
   ring_read(data, (size_t)byteCount);
@@ -1085,6 +1089,13 @@ static int32_t get_sound_data(uint8_t *data, int32_t byteCount) {
 
   return frames * 4;
 #endif
+}
+
+// fix15: our own IDF data callback (bypasses the library's global-pointer dispatch).
+static volatile uint32_t s_hg_cb_calls = 0;
+static int32_t hg_a2d_data_cb(uint8_t *data, int32_t len) {
+  s_hg_cb_calls++;
+  return get_sound_data(data, len);
 }
 
 void setup() {
@@ -1140,6 +1151,14 @@ void setup() {
     // Values are esp_a2d_connection_state_t:
     // 0=DISCONNECTED, 1=CONNECTING, 2=CONNECTED, 3=DISCONNECTING
     Serial.printf("[BT] conn_state=%d\n", (int)st);
+    // fix15 ROOT CAUSE (no TX audio): the library registers the PCM data callback straight after the
+    // asynchronous esp_a2d_source_init(); IDF 5.x rejects that with ESP_ERR_INVALID_STATE while init is
+    // still in progress and the library ignores the error, so the source never pulled PCM (a2dp_cb=0,
+    // ring overrunning, amp silent). By the time the link is CONNECTED init is done: register it again.
+    if (st == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+      const esp_err_t e = esp_a2d_source_register_data_callback(&hg_a2d_data_cb);
+      Serial.printf("[BT] data callback re-register: %s\n", esp_err_to_name(e));
+    }
   });
   a2dp_source.set_on_audio_state_changed([](esp_a2d_audio_state_t st, void *) {
     // Values are esp_a2d_audio_state_t:
@@ -1482,6 +1501,7 @@ void loop() {
     last_ring_underrun_bytes = underrun_bytes;
     last_ring_overrun_bytes = overrun_bytes;
 
+    Serial.printf("[CB] hg_calls=%u raw=%u heap=%u min=%u\n", (unsigned)s_hg_cb_calls, (unsigned)s_a2dp_cb_raw, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
     Serial.printf("[STATS] bt=%d conn=%d audio=%d ring=%u/%u i2s=+%uB (%u calls, %u zero, %u err, lastErr=%d) a2dp_cb=+%u underrun=+%uB overrun=+%uB\n",
                   (int)s_btStarted,
                   (int)a2dp_source.get_connection_state(),
