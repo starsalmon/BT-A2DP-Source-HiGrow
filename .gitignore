@@ -8,3 +8,8 @@ compile_commands.json
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Local-only: firmware backups, IDF component manifests, merge leftovers
+firmware-backups/
+src/idf_component.yml*
+*.orig
